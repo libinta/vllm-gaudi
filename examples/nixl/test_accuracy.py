@@ -5,7 +5,7 @@ import os
 import lm_eval
 import openai
 
-BASE_URL = "http://localhost:9195/v1"
+BASE_URL = "http://localhost:9192/v1"
 NUM_CONCURRENT = 100
 TASK = "gsm8k"
 FILTER = "exact_match,strict-match"
@@ -20,7 +20,7 @@ EXPECTED_VALUES = {
 SIMPLE_PROMPT = "The best part about working on vLLM is that I got to meet so many people across various different organizations like UCB, Google, and Meta which means"  # noqa: E501
 
 # Get model name from environment variable
-MODEL_NAME = os.environ.get("TEST_MODEL", "Qwen/Qwen3-0.6B")
+MODEL_NAME = os.environ.get("TEST_MODEL", "/root/software/data/pytorch/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659/")
 
 
 def run_simple_prompt():

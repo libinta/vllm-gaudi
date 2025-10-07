@@ -2,16 +2,34 @@
 set -xe
 
 # Models to run
-MODELS=(
-    "Qwen/Qwen3-0.6B"
-)
+#MODELS=(
+#    "Qwen/Qwen3-0.6B"
+#)
 #MODELS=(
 #	"meta-llama/Llama-3.1-8B"
 #)
-
+MODELS=(
+    "/root/software/data/pytorch/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659/"
+)
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1000000
+export VLLM_RPC_TIMEOUT=1000000000
+export NIXL_LOG_LEVEL=debug 
+#export UCX_LOG_LEVEL=debug
 export VLLM_USE_V1=1
-export VLLM_SKIP_WARMUP="true"
+export VLLM_SKIP_WARMUP=True
 export PT_HPU_LAZY_MODE=1
+export VLLM_EXPONENTIAL_BUCKETING=False
+export VLLM_PROMPT_BS_BUCKET_MIN=1
+export VLLM_PROMPT_SEQ_BUCKET_MIN=1
+export VLLM_PROMPT_SEQ_BUCKET_MIN=8192
+export VLLM_PROMPT_SEQ_BUCKET_STEP=8192
+export VLLM_PROMPT_SEQ_BUCKET_MAX=8192
+export VLLM_DECODE_BLOCK_BUCKET_MIN=1024
+export VLLM_DECODE_BLOCK_BUCKET_MAX=1184
+export VLLM_USE_PADDING_AWARE_SCHEDULING=1
+export DECODER_TP_RATIO=1
+export VLLM_CONTIGUOUS_PA=true
+export VLLM_UNIFIED_ATTN=True
 
 # Number of prefill and decode instances to create
 NUM_PREFILL_INSTANCES=${NUM_PREFILL_INSTANCES:-1} # Default to 1
@@ -160,7 +178,7 @@ run_tests_for_model() {
   done
 
   # Build the command for the proxy server with all the hosts and ports
-  PROXY_CMD="python toy_proxy_server.py --port 9195"
+  PROXY_CMD="python toy_proxy_server.py --port 9192"
 
   # Add all prefill hosts and ports
   PROXY_CMD+=" --prefiller-hosts ${PREFILL_HOSTS[@]}"

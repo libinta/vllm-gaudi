@@ -2629,14 +2629,22 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         warmup_mode: bool = False,
     ) -> ModelRunnerOutput:
+        print(f"libin debug with execuite model enter")
         self.run_defragmenter(scheduler_output, warmup_mode)
+        print(f"libin debug with execuite model done with defrag")
         batch_changed = self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
-            # Return empty ModelRunnerOuptut if there's no work to do.
-            return EMPTY_MODEL_RUNNER_OUTPUT
+            if not has_kv_transfer_group():
+                # Return empty ModelRunnerOuptut if there's no work to do.
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
         htorch.core.mark_step()
         batch = self.prepare_unified_batch(scheduler_output)
         htorch.core.mark_step()
+        print(f"libin debug with execuite model before model exe")
+        with set_forward_context(None, self.vllm_config):
+            self.maybe_setup_kv_connector(scheduler_output)
+        finished_sending, finished_recving = set(), set()
         non_flattened_hidden_states, aux_hidden_states, hidden_states, logits_device = \
             self._execute_model_generic(
                 token_ids=batch.token_ids.unsqueeze(-1),
@@ -2649,6 +2657,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 warmup_mode=warmup_mode)
         selected_req_ids = [batch.req_ids_cpu[idx] for idx in batch.logits_groups_cpu.tolist()]
         htorch.core.mark_step()
+        print(f"libin debug done with execuite model")
+        self.maybe_wait_for_kv_save()
+        finished_sending, finished_recving = (
+            self.get_finished_kv_transfers(scheduler_output))
         sampling_metadata = self._prepare_sampling(batch_changed, selected_req_ids, pad_to=logits_device.shape[0])
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
 
@@ -2674,6 +2686,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             prompt_logprobs_dict={},
             pooler_output=[],
         )
+        if has_kv_transfer_group():
+            get_kv_transfer_group().clear_connector_metadata()
+
+        print(f"libin debug done with execuite model exit")
         return model_runner_output
 
     @torch.inference_mode()
@@ -2892,6 +2908,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                                              prompt_batch_idx=idx,
                                                                              is_prompt=True)
                     self.profiler.record_counter(self.event_start, counters)
+
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (self.get_finished_kv_transfers(scheduler_output))
 
@@ -3824,7 +3841,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                   self.vllm_config.model_config.logits_processors),
                 )
 
-        self.defragmenter.initialize(self.kv_caches, self.block_size)
+        #self.defragmenter.initialize(self.kv_caches, self.block_size)
 
         prompt_profile_cfg, decode_profile_cfg = self._read_profiling_cfg()
         if prompt_profile_cfg or decode_profile_cfg:
@@ -4007,8 +4024,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
             get_kv_transfer_group().set_host_xfer_buffer_ops(copy_kv_blocks)
-            global hpu_buffer
         htorch.hpu.synchronize()
+        self.defragmenter.initialize(self.kv_caches, self.block_size)
+        
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
@@ -4316,21 +4334,15 @@ def copy_kv_blocks(
     target_device = dst_device.type
 
     i = 0
-    global hpu_buffer
-    use_hpu_buffer = False
+
     for layer_name in src_kv_caches:
         key_cache = src_kv_caches[layer_name][0]
         value_cache = src_kv_caches[layer_name][1]
 
-        if direction == "d2h" and use_hpu_buffer:
-            hpu_buffer[i][0] = key_cache.index_select(0, src_slot_mapping)
-            hpu_buffer[i][1] = value_cache.index_select(0, src_slot_mapping)
-        else:
-            #import remote_pdb;remote_pdb.set_trace()
-            dst_kv_caches[layer_name][0].index_put_((dst_slot_mapping, ),
-                                                    key_cache.index_select(0, src_slot_mapping).to(target_device))
-            dst_kv_caches[layer_name][1].index_put_((dst_slot_mapping, ),
-                                                    value_cache.index_select(0, src_slot_mapping).to(target_device))
+        dst_kv_caches[layer_name][0].index_put_((dst_slot_mapping, ),
+                                                key_cache.index_select(0, src_slot_mapping).to(target_device))
+        dst_kv_caches[layer_name][1].index_put_((dst_slot_mapping, ),
+                                                 value_cache.index_select(0, src_slot_mapping).to(target_device))
 
         i = i + 1
 

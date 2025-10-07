@@ -53,11 +53,16 @@ class VLLMKVCache(torch.nn.Module):
         return cache
 
     def fetch_from_cache(self, cache, blocks):
+
+        print(f"libin debug featch from {self.use_contiguous_pa=}  {blocks=}")
+
         if self.use_contiguous_pa:
             return cache[:blocks.size(0)]
         else:
             return cache.index_select(0, blocks)
-
+    def fetch_from_cache_prompt(self, cache, blocks):
+        print(f"libin debug featch from prompt  {blocks=}")
+        return cache.index_select(0, blocks)
 
 class VLLMFP8KVCache(VLLMKVCache):
 

@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 ###############################################################################
 
-import math
+import math,os
 import torch
 import functools
 from dataclasses import dataclass
@@ -243,7 +243,7 @@ class HPUUnifiedAttentionMetadata:
 def unified_attn(query: torch.tensor, key: torch.tensor, value: torch.tensor, key_cache: torch.tensor,
                  value_cache: torch.tensor, scale: float, metadata: HPUUnifiedAttentionMetadata) -> torch.tensor:
     """Main entry point for unified attention"""
-
+    #print(f"libin debug unified_attn enter")
     scaled_query = query * scale
     cache_utils = CacheUtils(key_cache, value_cache, metadata.block_size)
 
@@ -266,6 +266,7 @@ def unified_attn(query: torch.tensor, key: torch.tensor, value: torch.tensor, ke
                                  cache_utils=cache_utils)
 
     attn = merge(causal, shared, unique, feps=metadata.feps)
+    #print(f"libin debug unified_attn done {attn is None}")
     if attn is None:
         return query
     return attn
@@ -436,14 +437,17 @@ def create_unified_batch(req_ids: list[str], all_token_ids: torch.tensor, num_co
     unique_blocks = 0
     unique_block_mapping = None
     unique_bias = None
-
+    print(f"libin debug create_unified_batch {os.getenv('MY_ROLE')=} {contains_prompts=}")
+    if os.getenv('MY_ROLE')=='DECODE':
+        import remote_pdb;remote_pdb.set_trace()
     if contains_prompts:
         causal_bias = create_causal_bias(token_groups, token_positions, dtype)
-
+    import remote_pdb;remote_pdb.set_trace()
     ctx = Context.create(num_computed_tokens, block_table, block_size)
     if ctx:
         shared_ctx, unique_ctx = ctx.split(num_scheduled_tokens)
         if shared_ctx:
+            import remote_pdb;remote_pdb.set_trace()
             shared_blocks, orig_shared_blocks = torch.unique(shared_ctx.block_ids, return_inverse=True)
 
             shared_group_starts = group_starts.index_select(0, shared_ctx.group_ids)

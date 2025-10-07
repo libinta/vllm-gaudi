@@ -413,7 +413,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         if head_size not in supported_head_sizes:
             raise ValueError(f"Head size {head_size} is not supported by PagedAttention. "
                              f"Supported head sizes are: {supported_head_sizes}.")
-
+        self.is_prompt = True
         self.attn_type = attn_type
         if (self.attn_type != AttentionType.DECODER and self.attn_type != AttentionType.ENCODER_DECODER
                 and self.attn_type != AttentionType.ENCODER_ONLY):
@@ -594,8 +594,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             'batch2block_matmul_op': self.batch2block_matmul,
             'block2batch_matmul_op': self.block2batch_matmul,
             'fsdpa_op': self.fused_scaled_dot_product_attention,
-            'keys_fetch_func': self.k_cache.fetch_from_cache,
-            'values_fetch_func': self.v_cache.fetch_from_cache,
+            'keys_fetch_func': self.k_cache.fetch_from_cache if not self.is_prompt else  self.k_cache.fetch_from_cache_prompt,
+            'values_fetch_func': self.v_cache.fetch_from_cache if not self.is_prompt else self.v_cache.fetch_from_cache_prompt,
             'softmax_op': self.softmax,
             'block_list': block_list,
             'key_cache': key_cache,
@@ -656,6 +656,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
 
         if attn_metadata.is_prompt:
             # Prompt run.
+            self.is_prompt = True
             batch_size = attn_metadata.num_prefills
 
             query_shape = (batch_size, -1, self.num_heads, self.head_size)
@@ -669,6 +670,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                                        **self.common_attention_args())
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
+            self.is_prompt =  False
             # Enc/dec cross-attention KVs match encoder sequence length;
             # cross-attention utilizes special "cross" block tables
             block_list = attn_metadata.cross_block_list
@@ -790,7 +792,7 @@ class HPUUnifiedAttentionImpl(AttentionImpl):
                              f"Supported head sizes are: {supported_head_sizes}.")
 
         unsupported_features = {
-            'KV sharing': kv_sharing_target_layer_name is not None,
+            #'KV sharing': kv_sharing_target_layer_name is not None,
             'Alibi': alibi_slopes is not None,
             'Sliding window': sliding_window is not None,
             'non-GQA attention': num_kv_heads is None,
@@ -837,6 +839,7 @@ class HPUUnifiedAttentionImpl(AttentionImpl):
         value = value.unflatten(-1, (-1, self.head_size))
         key_cache = self.k_cache(key, key_cache, attn_metadata.slot_mapping)
         value_cache = self.v_cache(value, value_cache, attn_metadata.slot_mapping)
+        #import remote_pdb;remote_pdb.set_trace()
         output = unified_attn(
             query=query,
             key=key,
