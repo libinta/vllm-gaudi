@@ -438,16 +438,16 @@ def create_unified_batch(req_ids: list[str], all_token_ids: torch.tensor, num_co
     unique_block_mapping = None
     unique_bias = None
     print(f"libin debug create_unified_batch {os.getenv('MY_ROLE')=} {contains_prompts=}")
-    if os.getenv('MY_ROLE')=='DECODE':
-        import remote_pdb;remote_pdb.set_trace()
+    #if os.getenv('MY_ROLE')=='DECODE':
+    #    import remote_pdb;remote_pdb.set_trace()
     if contains_prompts:
         causal_bias = create_causal_bias(token_groups, token_positions, dtype)
-    import remote_pdb;remote_pdb.set_trace()
+    #import remote_pdb;remote_pdb.set_trace()
     ctx = Context.create(num_computed_tokens, block_table, block_size)
     if ctx:
         shared_ctx, unique_ctx = ctx.split(num_scheduled_tokens)
         if shared_ctx:
-            import remote_pdb;remote_pdb.set_trace()
+            #import remote_pdb;remote_pdb.set_trace()
             shared_blocks, orig_shared_blocks = torch.unique(shared_ctx.block_ids, return_inverse=True)
 
             shared_group_starts = group_starts.index_select(0, shared_ctx.group_ids)
