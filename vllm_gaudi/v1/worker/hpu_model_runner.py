@@ -2629,9 +2629,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         warmup_mode: bool = False,
     ) -> ModelRunnerOutput:
-        print(f"libin debug with execuite model enter")
         self.run_defragmenter(scheduler_output, warmup_mode)
-        print(f"libin debug with execuite model done with defrag")
         batch_changed = self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -2641,7 +2639,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         htorch.core.mark_step()
         batch = self.prepare_unified_batch(scheduler_output)
         htorch.core.mark_step()
-        print(f"libin debug with execuite model before model exe")
         with set_forward_context(None, self.vllm_config):
             self.maybe_setup_kv_connector(scheduler_output)
         finished_sending, finished_recving = set(), set()
@@ -2657,10 +2654,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 warmup_mode=warmup_mode)
         selected_req_ids = [batch.req_ids_cpu[idx] for idx in batch.logits_groups_cpu.tolist()]
         htorch.core.mark_step()
-        print(f"libin debug done with execuite model")
         self.maybe_wait_for_kv_save()
-        finished_sending, finished_recving = (
-            self.get_finished_kv_transfers(scheduler_output))
+        finished_sending, finished_recving = (self.get_finished_kv_transfers(scheduler_output))
         sampling_metadata = self._prepare_sampling(batch_changed, selected_req_ids, pad_to=logits_device.shape[0])
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
 
@@ -2685,11 +2680,13 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                finished_sending=finished_sending,
+                finished_recving=finished_recving,
+            )
         )
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
-
-        print(f"libin debug done with execuite model exit")
         return model_runner_output
 
     @torch.inference_mode()
