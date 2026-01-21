@@ -4571,8 +4571,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         batch = image_args if self.get_model().vision_bucket_manager.is_batch_based else count
         if self.get_model().vision_bucket_manager.is_batch_based:
             # Create ImageDummyOptions for Gemma3
-            width=896,  # pixels as in gemma3 config
-            height=896  # pixels as in gemma3 config
+            w=896,  # pixels as in gemma3 config
+            h=896  # pixels as in gemma3 config
             batch = image_args
         else:
             patch_size = int(self.get_patch_size_from_model())
@@ -4586,14 +4586,12 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             h = grid_h * patch_size
             batch = count
         self.model_config_copy.max_model_len = 4096
-        #logger.info(f"libin debug warmup {modality=} {w=} {h=} {count=}")
         if modality == 'image':
             self.model_config_copy.limit_mm_per_prompt = {  
                 "image": {"count": count, "width": w, "height": h}
             }
         elif modality == 'video':
             video_options = self.model_config_copy.get_multimodal_config().get_dummy_options("video")
-            #logger.info(f'\n libin debug {video_options=}')
             num_frames = video_options.num_frames if video_options and hasattr(video_options, 'num_frames') else 100
             w = video_options.width if video_options and hasattr(video_options, 'width') else w
             h = video_options.height if video_options and hasattr(video_options, 'height') else h
