@@ -25,6 +25,7 @@ export MODEL=/software/data/pytorch/huggingface/hub/models--Qwen--Qwen3.5-397B-A
 python test.py \
   --model $MODEL \
   --mode text \
+  --enforce-eager \
   --tensor-parallel-size 8 \
   --max-model-len 16384 \
   --max-num-batched-tokens 4096 2>&1 | tee log_8x.txt

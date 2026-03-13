@@ -56,6 +56,7 @@ def run_text_only(
     max_num_batched_tokens: int,
     gpu_memory_utilization: float,
     enable_reasoning: bool = False,  # Off by default
+    enforce_eager: bool = False,
 ):
     """Run Qwen3.5 in language-only mode."""  
     mode_desc = "with reasoning" if enable_reasoning else "without reasoning"
@@ -70,6 +71,7 @@ def run_text_only(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
     )
     
     # Adjust max_tokens based on reasoning mode: 50 for direct, 500 for reasoning
@@ -141,6 +143,7 @@ def run_gsm8k(
     max_num_seqs: int,
     max_num_batched_tokens: int,
     gpu_memory_utilization: float,
+    enforce_eager: bool = False,
 ):
     """Run Qwen3.5 with GSM8K lm_eval settings."""  
     print(f"Running {model_name} in GSM8K mode (matching lm_eval settings)...")  
@@ -156,6 +159,7 @@ def run_gsm8k(
         gpu_memory_utilization=gpu_memory_utilization,
         reasoning_parser='qwen3',  # CRITICAL: Enable Qwen3 reasoning parser at engine level
         seed=1234,  # Match lm_eval seed for reproducibility
+        enforce_eager=enforce_eager,
     )  
       
     # Match lm_eval defaults for GSM8K
@@ -210,6 +214,7 @@ def run_text_image(
     max_num_seqs: int = 1,
     max_num_batched_tokens: int = 512,
     gpu_memory_utilization: float = 0.5,
+    enforce_eager: bool = False,
 ):
     """Run Qwen3.5 with text+image support."""  
     print(f"Running {model_name} with text+image support...")  
@@ -223,6 +228,7 @@ def run_text_image(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
     )  
 
     if not image_url:
@@ -277,6 +283,7 @@ def run_text_video(
     max_num_seqs: int = 1,
     max_num_batched_tokens: int = 4096,
     gpu_memory_utilization: float = 0.5,
+    enforce_eager: bool = False,
 ):
     """Run Qwen3.5 with text+video support."""
     print(f"Running {model_name} with text+video {video_url} support with prompt: {prompt}...")
@@ -291,6 +298,7 @@ def run_text_video(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
     )
     
     # Load video
@@ -392,6 +400,11 @@ def main():
         default=0.75,
         help="Fraction of device memory vLLM may reserve for KV/cache planning",
     )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable graph compilation and run in eager mode for stability debugging.",
+    )
     parser.add_argument(  
         "--image-url",
         default="https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
@@ -437,6 +450,7 @@ def main():
             args.max_num_batched_tokens,
             args.gpu_memory_utilization,
             enable_reasoning=args.reasoning,  # Pass reasoning flag
+            enforce_eager=args.enforce_eager,
         )
     elif args.mode == "gsm8k":  
         run_gsm8k(
@@ -448,6 +462,7 @@ def main():
             args.max_num_seqs,
             args.max_num_batched_tokens,
             args.gpu_memory_utilization,
+            args.enforce_eager,
         )
     elif args.mode == "image":  
         if not args.image_url:  
@@ -462,6 +477,7 @@ def main():
             args.max_num_seqs,
             args.max_num_batched_tokens,
             args.gpu_memory_utilization,
+            args.enforce_eager,
         )
     elif args.mode == "video":
         if not args.video_url:
@@ -476,6 +492,7 @@ def main():
             args.max_num_seqs,
             args.max_num_batched_tokens,
             args.gpu_memory_utilization,
+            args.enforce_eager,
         )
   
   

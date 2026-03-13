@@ -142,6 +142,11 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
+    @staticmethod
+    def _moe_activation_str(layer: torch.nn.Module) -> str:
+        act = getattr(layer, "activation", "silu")
+        return act.value if hasattr(act, "value") else str(act)
+
     def create_weights(self, *args, **kwargs) -> None:
         if hpu_ops.is_hpu_gaudi2:
             kwargs['weight_loader'] = hpu_ops.gaudi_weight_wrapper(kwargs.get('weight_loader'))
@@ -206,7 +211,7 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
             topk_ids = topk_ids.to(torch.int64)
             topk_weights = topk_weights.to(x.dtype)
 
-        if _get_dp_size(layer) > 1:
+        if layer.moe_parallel_config.dp_size > 1:
             dp_metadata = get_hpu_dp_metadata()
             if not (has_quant_config(layer.vllm_config.model_config) and self.use_dispatch_fn):
                 hidden_states_across_dp = dp_metadata.hidden_states_across_dp if dp_metadata is not None else None
@@ -226,7 +231,7 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
             topk_ids,
             topk_weights,
             permuted_weights=True,
-            activation=_moe_activation_str(layer),
+            activation=self._moe_activation_str(layer),
         )
         return output.view(*(output.size(0), *input_shape[1:]))
 
