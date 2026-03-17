@@ -959,9 +959,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             self.mamba_chunk_size = 0
        
-        self.use_hybrid_cache = os.getenv('VLLM_USE_HYBRID_CACHE', 'false').strip().lower() in ("1", "true")
-        self.use_naive_mamba_cache_sharing = os.getenv('VLLM_USE_NAIVE_MAMBA_CACHE_SHARING',
-                                                       'true').strip().lower() in ("1", "true")
+        # Auto-detect GDN/linear_attention models (e.g. Qwen3.5) and default
+        # to hybrid cache + compact allocation.  Standard Mamba2 models keep
+        # the original defaults.  Env vars still override if explicitly set.
+        _has_linear_attn_layers = (
+            self.model_config.get_num_layers_by_block_type(
+                self.parallel_config, "linear_attention") > 0)
+        _hybrid_env = os.getenv('VLLM_USE_HYBRID_CACHE')
+        _naive_env = os.getenv('VLLM_USE_NAIVE_MAMBA_CACHE_SHARING')
+        if _hybrid_env is not None:
+            self.use_hybrid_cache = _hybrid_env.strip().lower() in ("1", "true")
+        else:
+            self.use_hybrid_cache = _has_linear_attn_layers
+        if _naive_env is not None:
+            self.use_naive_mamba_cache_sharing = _naive_env.strip().lower() in ("1", "true")
+            if self.use_naive_mamba_cache_sharing and _has_linear_attn_layers:
+                logger.warning(
+                    "VLLM_USE_NAIVE_MAMBA_CACHE_SHARING=1 has no effect on "
+                    "GDN/linear_attention layers — they always use compact "
+                    "allocation (max_num_reqs slots). The flag only applies "
+                    "to standard Mamba2 layers.")
+        else:
+            self.use_naive_mamba_cache_sharing = not _has_linear_attn_layers
 
         # Lazy initialization
         # self.model: nn.Module  # set after load_model
@@ -2285,15 +2304,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             num_prefill_reqs = len(contents.req_ids)
             all_state_indices_cpu = []
             for group_idx in range(len(self.input_batch.block_table.block_tables)):
-                block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
-
                 state_indices_cpu = torch.zeros(num_prefill_reqs, dtype=torch.int32)
 
-                for i, req_id in enumerate(contents.req_ids):
-                    req_idx = self.input_batch.req_id_to_index[req_id]
-                    # Get the first block for this request (same logic as decode)
-                    first_block = block_table_cpu_tensor[req_idx, 0]
-                    state_indices_cpu[i] = first_block
+                if group_idx in self._compact_gdn_group_ids:
+                    # Compact GDN: use batch position as state index
+                    # (slot i stores request i's recurrent state).
+                    for i in range(num_prefill_reqs):
+                        state_indices_cpu[i] = i
+                else:
+                    block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
+                    for i, req_id in enumerate(contents.req_ids):
+                        req_idx = self.input_batch.req_id_to_index[req_id]
+                        first_block = block_table_cpu_tensor[req_idx, 0]
+                        state_indices_cpu[i] = first_block
 
                 if num_prefill_reqs < target_bs:
                     padding = torch.full((target_bs - num_prefill_reqs, ),
@@ -2599,8 +2622,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.num_mamba_like_layers > 0:
             all_state_indices_cpu = []
             for group_idx in range(len(self.input_batch.block_table.block_tables)):
-                block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
-                state_indices_cpu = block_table_cpu_tensor[:num_decodes, 0].clone()
+                if group_idx in self._compact_gdn_group_ids:
+                    # Compact GDN: slot i stores request i's state.
+                    state_indices_cpu = torch.arange(num_decodes, dtype=torch.int32)
+                else:
+                    block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
+                    state_indices_cpu = block_table_cpu_tensor[:num_decodes, 0].clone()
                 if num_decodes < padded_batch_size:
                     padding = torch.full((padded_batch_size - num_decodes, ),
                                          self._MAMBA_PAD_BLOCK_ID,
@@ -5859,6 +5886,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        # Track which cache groups are GDN/linear_attention (compact alloc).
+        self._compact_gdn_group_ids: set[int] = set()
         self.is_encoder_only_attn = False
         self.may_add_encoder_only_layers_to_kv_cache_config()
         if self.num_mamba_like_layers > 0:
@@ -5954,17 +5983,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         kv_caches[layer_name] = (kc, vc, None, None)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in ("gdn_attention", "linear_attention"):
-                        # GDN/linear_attention layers use contiguous tensors
-                        # because torch.compile's aot_autograd cannot handle
-                        # input mutations on as_strided views with different
-                        # dtypes (raw buffer is bf16, GDN states are float32).
-                        # Skip if already created by a sibling layer sharing
-                        # the same kv_cache_tensor (same as naive path).
+                        # GDN/linear_attention: compact allocation.
+                        # Each request needs exactly 1 state slot (recurrent
+                        # state is fixed-size, independent of sequence length),
+                        # so allocate max_num_reqs+1 slots instead of
+                        # num_blocks+1.  This saves massive memory when
+                        # block_size is inflated by page_size_padded.
+                        self._compact_gdn_group_ids.add(group_idx)
                         if isinstance(kv_caches.get(layer_name), tuple):
                             continue
                         state_tensors = []
                         for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (num_blocks + 1, *shape)
+                            target_shape = (self.max_num_reqs + 1, *shape)
                             tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
                             state_tensors.append(tensor)
                         # Propagate to all layers sharing the same kv_cache_tensor.
@@ -6006,7 +6036,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         pass
         elif self.use_naive_mamba_cache_sharing and self.num_mamba_like_layers > 0:
-            for group in kv_cache_config.kv_cache_groups:
+            for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
                 kv_cache_spec = group.kv_cache_spec
                 for layer_name in group.layer_names:
                     kv_cache_spec = group.kv_cache_spec
@@ -6024,8 +6054,27 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         kc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         kv_caches[layer_name] = (kc, vc, None, None)
+                    elif isinstance(kv_cache_spec, MambaSpec) and \
+                            kv_cache_spec.mamba_type in ("gdn_attention", "linear_attention"):
+                        # GDN/linear_attention: always use compact allocation.
+                        # Recurrent state is fixed-size per request, not paged,
+                        # so num_blocks+1 slots is always wasteful.
+                        self._compact_gdn_group_ids.add(group_idx)
+                        if isinstance(kv_caches.get(layer_name), tuple):
+                            continue
+                        state_tensors = []
+                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                            target_shape = (self.max_num_reqs + 1, *shape)
+                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
+                            state_tensors.append(tensor)
+                        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                            if layer_name not in kv_cache_tensor.shared_by:
+                                continue
+                            for shared_layer in kv_cache_tensor.shared_by:
+                                kv_caches[shared_layer] = tuple(state_tensors)
+                            break
                     elif isinstance(kv_cache_spec, MambaSpec):
-                        # skip if already created by another layer sharing the same kv cache tensor
+                        # Standard Mamba2: use num_blocks+1 allocation.
                         if layer_name in kv_caches:
                             continue
                         state_tensors = []

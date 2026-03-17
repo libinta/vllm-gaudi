@@ -407,7 +407,10 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         # 2.2: Process the remaining part
         if is_prompt:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+            # GDN always uses compact allocation ([0..N-1] slots),
+            # so use direct slice instead of gather.
+            num_reqs = non_spec_state_indices_tensor.size(0)
+            initial_state = ssm_state[:num_reqs].clone()
             initial_state[~has_initial_state.bool(), ...] = 0
             
             (
@@ -425,11 +428,12 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                 use_qk_l2norm_in_kernel=True,
                 chunk_size=self.mamba_chunk_size,
             )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+            # Write back final state to cache
+            _final = last_recurrent_state.to(
                 device=ssm_state.device,
                 dtype=ssm_state.dtype,
             )
+            ssm_state[:num_reqs] = _final
             
         elif num_decodes > 0:
 
