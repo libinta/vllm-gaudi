@@ -23,6 +23,31 @@ from vllm_gaudi.extension.logger import logger as init_logger
 
 logger = init_logger()
 
+# Qwen3.5 hybrid model architectures that need block_size reset to 128
+QWEN3_5_HYBRID_ARCHS = {
+    "Qwen3MoeForCausalLM",
+    "Qwen3_VLMoeForConditionalGeneration",
+}
+
+
+def is_qwen3_5_hybrid_model(model_config: ModelConfig) -> bool:
+    """Detect if model is a Qwen3.5 hybrid model (GDN attention)."""
+    if model_config is None:
+        return False
+
+    architectures = set(getattr(getattr(model_config, "hf_config", None), "architectures", []) or [])
+    architecture = getattr(model_config, "architecture", None)
+    if architecture is not None:
+        architectures.add(architecture)
+
+    # Also check hf_text_config for multimodal models
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is not None:
+        text_architectures = set(getattr(hf_text_config, "architectures", []) or [])
+        architectures.update(text_architectures)
+
+    return any(arch in QWEN3_5_HYBRID_ARCHS for arch in architectures)
+
 
 def retain_envs(var_name):
     retain_var_list = ['GLOO_SOCKET_IFNAME', 'HCCL_SOCKET_IFNAME', 'NCCL_SOCKET_IFNAME']
@@ -105,6 +130,17 @@ class HpuPlatform(Platform):
         cache_config = vllm_config.cache_config
         if not cache_config.user_specified_block_size:
             cache_config.block_size = 128
+        
+        # Qwen3.5 hybrid models: force block_size to 128 even if user specified
+        # This is required for proper GDN attention support
+        if is_qwen3_5_hybrid_model(vllm_config.model_config):
+            if cache_config.block_size != 128:
+                logger.info(
+                    "Reset block_size to 128 for Qwen3.5 hybrid model "
+                    "(was %d).", cache_config.block_size
+                )
+                cache_config.block_size = 128
+        
         # Hybrid GDN/Mamba models: upstream HybridAttentionMambaModelConfig
         # already ran and computed block_size / mamba_page_size_padded for
         # GPU.  HPU overrode block_size to 128 above, so we must re-align

@@ -22,8 +22,24 @@ export VLLM_CONTIGUOUS_PA=1
 #    建议显式设置 VLLM_SPLIT_MOE_COMPILATION=1，或者降低阈值
 # export VLLM_SPLIT_MOE_EXPERT_THRESHOLD=200
 
-# 5. (可选) 减少 torch.compile recompilations
-# export VLLM_MOE_GRAPH_BREAK=1
+# 5. (重要) 减少 torch.compile recompilations - 推荐启用！
+#    这个选项可以显著减少 Qwen3.5-397B 的 warmup 编译时间
+export VLLM_MOE_GRAPH_BREAK=1
+
+# 6. (重要) 减少 warmup buckets - 大幅减少编译时间！
+#    默认 40 个 buckets 可能需要 30-60 分钟
+#    减少到 10-15 个可以缩短到 10-20 分钟
+export VLLM_PROMPT_BS_BUCKET_MIN=1
+export VLLM_PROMPT_BS_BUCKET_MAX=4
+export VLLM_PROMPT_CTX_BUCKET_MIN=2048
+export VLLM_PROMPT_CTX_BUCKET_MAX=8192
+export VLLM_DECODE_BS_BUCKET_MIN=1
+export VLLM_DECODE_BS_BUCKET_MAX=8
+
+# 7. (重要) Qwen3.5 GDN hybrid 模型必需！
+#    这两个参数必须都设置为 true 才能改善 graph compilation 性能
+export ENABLE_EXPERIMENTAL_FLAGS=true
+export ENABLE_SKIP_REMOVAL_OF_GRAPH_INPUT_IDENTITY_NODES=true
 
 # ============================================
 # 关于 WARNING 的说明
@@ -46,7 +62,14 @@ export VLLM_CONTIGUOUS_PA=1
 # export VLLM_DECODE_BLOCK_BUCKET_MIN=6
 
 # 启用开发者模式查看 warmup 进度
-# export VLLM_DEVELOPER_MODE=1
+export VLLM_DEVELOPER_MODE=1
+
+# 设置日志级别（DEBUG, INFO, WARNING, ERROR）
+# 默认是 INFO，设置为 WARNING 可以减少 INFO 日志输出
+# export VLLM_LOGGING_LEVEL=WARNING
+
+# 启用 torch compile 调试信息
+export TORCH_COMPILE_DEBUG=1
 
 # ============================================
 # 启动命令
