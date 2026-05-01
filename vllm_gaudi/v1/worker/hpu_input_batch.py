@@ -546,7 +546,11 @@ class InputBatch:
         # NOTE(chendi): don't reset batch_update_builder here
         # TODO: follow upstream PR#16728 for enabling batch_update
         self._invalidate_prompt_token_ids_cache()
-        self.sampling_metadata = self._make_sampling_metadata()
+        # Skip _make_sampling_metadata() here — it does full H2D copies of
+        # all sampling tensors, but the result is immediately overwritten by
+        # make_selective_sampling_metadata(skip_copy=False) in
+        # _prepare_sampling. The selective path already handles the H2D
+        # copy when batch_changed=True (skip_copy=False).
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
