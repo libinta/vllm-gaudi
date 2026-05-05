@@ -46,7 +46,15 @@ class XPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         self.layer_param_names = layer_param_names
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        replace_parameter(layer, "weight", layer.weight.data.t())
+        # fp8_gemm_w8a16 expects weight in [in, out] layout.
+        # W8A16 quant methods (e.g. CT W8A16Fp8) pass [out, in] contiguous.
+        # W8A8 quant methods (e.g. modelopt, fp8) already .t() → non-contiguous.
+        # Detect via contiguity: checkpoint weights are always contiguous.
+        weight = layer.weight.data
+        if weight.is_contiguous():
+            # Still [out, in] from checkpoint — need transpose
+            replace_parameter(layer, "weight", weight.t())
+        # else: already transposed by quant method — no-op
 
     def apply_weights(
         self,
