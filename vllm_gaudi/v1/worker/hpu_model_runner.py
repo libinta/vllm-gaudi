@@ -1306,8 +1306,31 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
 
             if num_indices < target_bs:
+                # Compact GDN state tensors have far fewer slots than
+                # num_blocks, so remainder(num_blocks, compact_total) can
+                # alias a real request's slot.  Use -1 instead:
+                # remainder(-1, N) == N-1 which is the dedicated garbage
+                # slot at the end of the compact tensor.
+                is_compact = group_idx in self._compact_gdn_group_ids
+                pad_value = -1 if is_compact else self._MAMBA_PAD_BLOCK_ID
+                if is_compact:
+                    compact_slots = self._gdn_max_reqs * self._num_gdn_groups + 2
+                    old_pad = self._MAMBA_PAD_BLOCK_ID
+                    old_alias = old_pad % compact_slots
+                    new_alias = (-1) % compact_slots
+                    max_valid = num_indices * self._num_gdn_groups
+                    logger.info(
+                        "GDN pad: group=%d, real=%d, target=%d, "
+                        "compact_slots=%d, old_pad=%d->remainder=%d "
+                        "(would_corrupt=%s), new_pad=-1->remainder=%d "
+                        "(garbage_slot=%s)",
+                        group_idx, num_indices, target_bs,
+                        compact_slots, old_pad, old_alias,
+                        old_alias <= max_valid, new_alias,
+                        new_alias == compact_slots - 1,
+                    )
                 padding = torch.full((target_bs - num_indices, ),
-                                     self._MAMBA_PAD_BLOCK_ID,
+                                     pad_value,
                                      dtype=torch.int32,
                                      device='cpu')
                 state_indices_cpu = torch.cat([state_indices_cpu, padding])
