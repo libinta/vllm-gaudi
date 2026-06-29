@@ -1158,6 +1158,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # index is `s * num_gdn_groups + g + 1` (1-based, slot 0 unused).
         # Tensor size: max_num_reqs * num_gdn_groups + 2.
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
+        # VLLM_GDN_DESHARE (default ON): give each GDN layer its OWN compact
+        # state slab (distinct storage base) so layers do not collide on the
+        # bridge's storage-base key (cross-recipe mis-bind). Each per-layer slab
+        # holds only its own group's slots, so it is sized gdn_max_reqs+2 and
+        # indexed base_slot+1 (no num_gdn_groups multiplier / g_offset).
+        self._gdn_deshare = os.environ.get("VLLM_GDN_DESHARE", "1").strip().lower() in ("1", "true")
         self._compact_gdn_group_ids: set[int] = set()
         self._compact_gdn_group_offset: dict[int, int] = {}  # {group_idx: g_offset}
         self._num_gdn_groups = 0  # set during initialize_kv_cache
@@ -1332,7 +1338,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 for i, req_idx in enumerate(req_indices):
                     req_id = self.input_batch.req_ids[req_idx]
                     base_slot = self._gdn_req_to_base_slot[req_id]
-                    state_indices_cpu[i] = base_slot * self._num_gdn_groups + g_offset + 1
+                    if self._gdn_deshare:
+                        # Per-layer slab holds only this group's slots.
+                        state_indices_cpu[i] = base_slot + 1
+                    else:
+                        state_indices_cpu[i] = base_slot * self._num_gdn_groups + g_offset + 1
             else:
                 block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
                 state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
@@ -6124,20 +6134,34 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         if isinstance(kv_caches.get(layer_name), tuple):
                             continue
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        state_tensors = []
-                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (compact_total, *shape)
-                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
-                            state_tensors.append(tensor)
-                        logger.debug("GDN compact tensor: %d slots (max_reqs=%d * groups=%d + 2) vs baseline %d",
-                                     compact_total, gdn_max_reqs, self._num_gdn_groups, num_blocks + 1)
-                        # Propagate to all layers sharing the same kv_cache_tensor.
+                        # De-share (default ON): each layer gets its OWN slab,
+                        # sized for just its group's slots (gdn_max_reqs+2),
+                        # indexed base_slot+1. Distinct storage base per layer
+                        # avoids the bridge storage-base mis-bind. Set
+                        # VLLM_GDN_DESHARE=0 for the old shared allocation
+                        # (one slab of gdn_max_reqs*num_groups+2 for all layers).
+                        if self._gdn_deshare:
+                            compact_total = gdn_max_reqs + 2
+                        else:
+                            compact_total = gdn_max_reqs * self._num_gdn_groups + 2
+                        logger.debug("GDN compact tensor: %d slots (deshare=%s, max_reqs=%d, groups=%d) vs baseline %d",
+                                     compact_total, self._gdn_deshare, gdn_max_reqs, self._num_gdn_groups, num_blocks + 1)
                         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                             if layer_name not in kv_cache_tensor.shared_by:
                                 continue
-                            for shared_layer in kv_cache_tensor.shared_by:
-                                kv_caches[shared_layer] = tuple(state_tensors)
+                            if self._gdn_deshare:
+                                for shared_layer in kv_cache_tensor.shared_by:
+                                    kv_caches[shared_layer] = tuple(
+                                        torch.zeros((compact_total, *shape), dtype=dtype, device=self.device)
+                                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)
+                                    )
+                            else:
+                                state_tensors = [
+                                    torch.zeros((compact_total, *shape), dtype=dtype, device=self.device)
+                                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)
+                                ]
+                                for shared_layer in kv_cache_tensor.shared_by:
+                                    kv_caches[shared_layer] = tuple(state_tensors)
                             break
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
@@ -6212,17 +6236,30 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         if isinstance(kv_caches.get(layer_name), tuple):
                             continue
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        state_tensors = []
-                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (compact_total, *shape)
-                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
-                            state_tensors.append(tensor)
+                        # De-share (default ON): each layer gets its OWN slab,
+                        # sized for just its group's slots (gdn_max_reqs+2),
+                        # indexed base_slot+1. Set VLLM_GDN_DESHARE=0 for the old
+                        # shared allocation.
+                        if self._gdn_deshare:
+                            compact_total = gdn_max_reqs + 2
+                        else:
+                            compact_total = gdn_max_reqs * self._num_gdn_groups + 2
                         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                             if layer_name not in kv_cache_tensor.shared_by:
                                 continue
-                            for shared_layer in kv_cache_tensor.shared_by:
-                                kv_caches[shared_layer] = tuple(state_tensors)
+                            if self._gdn_deshare:
+                                for shared_layer in kv_cache_tensor.shared_by:
+                                    kv_caches[shared_layer] = tuple(
+                                        torch.zeros((compact_total, *shape), dtype=dtype, device=self.device)
+                                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)
+                                    )
+                            else:
+                                state_tensors = [
+                                    torch.zeros((compact_total, *shape), dtype=dtype, device=self.device)
+                                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)
+                                ]
+                                for shared_layer in kv_cache_tensor.shared_by:
+                                    kv_caches[shared_layer] = tuple(state_tensors)
                             break
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
@@ -6355,10 +6392,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             gdn_max_reqs = self._gdn_max_reqs
             self._gdn_slot_free_list = list(range(gdn_max_reqs - 1, -1, -1))
             self._gdn_req_to_base_slot.clear()
-            compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-            logger.info("GDN compact: %d groups, %d base_slots, tensor_dim0=%d vs baseline=%d, free_list_len=%d",
-                        len(self._compact_gdn_group_ids), gdn_max_reqs, compact_total, num_blocks + 1,
-                        len(self._gdn_slot_free_list))
+            compact_total = (gdn_max_reqs + 2) if self._gdn_deshare \
+                else (gdn_max_reqs * self._num_gdn_groups + 2)
+            logger.info("GDN compact: deshare=%s, %d groups, %d base_slots, tensor_dim0=%d vs baseline=%d, free_list_len=%d",
+                        self._gdn_deshare, len(self._compact_gdn_group_ids), gdn_max_reqs, compact_total,
+                        num_blocks + 1, len(self._gdn_slot_free_list))
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(self.get_kv_caches_4D(kv_caches))

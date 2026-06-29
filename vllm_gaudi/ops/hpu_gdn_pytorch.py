@@ -36,12 +36,20 @@ _GDN_COMPUTE_DTYPE = torch.float32 if os.getenv("VLLM_GDN_COMPUTE_FP32", "1") ==
 _USE_EXACT_SOLVE = os.getenv("VLLM_GDN_EXACT_SOLVE", "0") == "1"
 
 
-@torch._dynamo.disable
-def _preprocess_qk_l2norm(q, k):
+def _preprocess_qk_l2norm_impl(q, k):
     """L2norm in eager mode — HPU torch.compile miscompiles l2norm."""
     q = _l2norm_last_dim(q.to(torch.float32))
     k = _l2norm_last_dim(k.to(torch.float32))
     return q, k
+
+
+# l2norm folded into the compiled graph by default (VLLM_GDN_L2NORM_IN_GRAPH=1).
+# Set VLLM_GDN_L2NORM_IN_GRAPH=0 to restore the @torch._dynamo.disable eager
+# island (the numerical-correctness workaround for the HPU l2norm miscompile).
+if os.environ.get("VLLM_GDN_L2NORM_IN_GRAPH", "1").strip().lower() in ("1", "true"):
+    _preprocess_qk_l2norm = _preprocess_qk_l2norm_impl
+else:
+    _preprocess_qk_l2norm = torch._dynamo.disable(_preprocess_qk_l2norm_impl)
 
 
 def hpu_chunk_gdr_preprocess(
