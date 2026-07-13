@@ -7068,6 +7068,10 @@ class HPUAttentionMetadataProcessor:
         self.sliding_window = vllm_config.model_config.get_sliding_window()
         self.interleaved_sliding_window = (is_interleaved(vllm_config.model_config.hf_text_config)
                                            and self.sliding_window)
+        # Option A: window-relative prefill mask when sliding layers own a
+        # separate, window-truncated KV pool. Evaluated here (not read from the
+        # runner) because the mask is built in this processor.
+        self.use_sliding_window_kv = _sliding_window_kv_enabled(vllm_config)
 
         if self.interleaved_sliding_window:
             self.use_window_sdpa = with_default(get_config().PT_HPU_SDPA_QKV_SLICE_MODE_FWD, False)
@@ -7168,10 +7172,26 @@ class HPUAttentionMetadataProcessor:
             block_size = getattr(prefill_metadata, "block_size", self.block_size)
             max_context_len = max_context_len * block_size
 
-            invalid_lens_t = context_lens_t - window_size + torch.arange(seq_len, device=device) - 1
-            past_indices = torch.arange(max_context_len, device=device)
-            past_mask = ((past_indices.unsqueeze(0) > invalid_lens_t.unsqueeze(-1)) &
-                         (past_indices.unsqueeze(0) < context_lens_t.unsqueeze(-1).unsqueeze(0))).unsqueeze(1)
+            if getattr(self, "use_sliding_window_kv", False):
+                # Option A: only the tail `max_context_len` window columns are
+                # present (older blocks were evicted). Map context column c to
+                # absolute position base + c, where base aligns the kept window
+                # to the end of the real context. Without this offset the mask
+                # collapses to all-False (see test_window_relative_mask_*).
+                aligned_ctx = ((context_lens_t + block_size - 1) // block_size) * block_size
+                base = torch.clamp(aligned_ctx - max_context_len, min=0)  # [batch]
+                past_indices = (base.unsqueeze(-1)
+                                + torch.arange(max_context_len, device=device))  # [batch, K]
+                invalid_lens_t = (context_lens_t.unsqueeze(-1) - window_size
+                                  + torch.arange(seq_len, device=device).unsqueeze(0) - 1)  # [batch, seq_len]
+                past_mask = ((past_indices.unsqueeze(1) > invalid_lens_t.unsqueeze(-1))
+                             & (past_indices.unsqueeze(1) < context_lens_t.view(-1, 1, 1))
+                             ).unsqueeze(1)  # [batch, 1, seq_len, K]
+            else:
+                invalid_lens_t = context_lens_t - window_size + torch.arange(seq_len, device=device) - 1
+                past_indices = torch.arange(max_context_len, device=device)
+                past_mask = ((past_indices.unsqueeze(0) > invalid_lens_t.unsqueeze(-1)) &
+                             (past_indices.unsqueeze(0) < context_lens_t.unsqueeze(-1).unsqueeze(0))).unsqueeze(1)
 
             # Create boolean sliding window mask
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=shift)

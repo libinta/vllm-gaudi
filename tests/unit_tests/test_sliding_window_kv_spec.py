@@ -138,3 +138,89 @@ def test_sliding_group_id_none_when_disabled():
     full = SimpleNamespace(kv_cache_spec=MagicMock(spec=FullAttentionSpec))
     runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[full])
     assert HPUModelRunner._get_sliding_attention_group_id(runner) is None
+
+
+# --------------------------------------------------------------------------
+# Task 5: window-relative prefill mask
+# --------------------------------------------------------------------------
+def _past_mask(context_len, seq_len, window, K_cols, base):
+    """Reference for the fixed past_mask (single request), matching the
+    production formula."""
+    ctx = torch.tensor([context_len])
+    invalid = ctx - window + torch.arange(seq_len) - 1          # [seq_len]
+    past_indices = base + torch.arange(K_cols)                  # [K_cols] absolute
+    return ((past_indices.unsqueeze(0) > invalid.unsqueeze(-1)) &
+            (past_indices.unsqueeze(0) < ctx.unsqueeze(-1)))    # [seq_len, K_cols]
+
+
+def test_window_relative_mask_not_all_false_when_context_evicted():
+    # Long context, small window: with the base offset the mask selects the
+    # in-window tail columns (non-empty). base=0 (the bug) yields all-False.
+    context_len = 100_000
+    window = 1024
+    block_size = 128
+    seq_len = 128
+    K = math.ceil((window - 1 + seq_len) / block_size) + 1   # kept blocks
+    K_cols = K * block_size
+    base = max(0, math.ceil(context_len / block_size) * block_size - K_cols)
+
+    pm = _past_mask(context_len, seq_len, window, K_cols, base)
+    assert pm.any(), "window-relative past_mask must be non-empty"
+
+    pm_buggy = _past_mask(context_len, seq_len, window, K_cols, base=0)
+    assert not pm_buggy.any(), "zero-base reproduces the bug (all-False)"
+
+
+def test_production_mask_non_empty_with_flag_on(monkeypatch):
+    """Drive the real _set_attn_bias_for_sliding_window with Option A on and a
+    window-truncated block_list; the produced window_attn_bias must contain
+    finite (attended) entries in the context region, not be all -inf."""
+    import vllm_gaudi.v1.worker.hpu_model_runner as hm
+    from vllm_gaudi.v1.worker.hpu_model_runner import HPUAttentionMetadataProcessor
+
+    window = 1024
+    block_size = 128
+    seq_len = 128
+    context_len = 100_000
+    batch_size = 1
+    K = math.ceil((window - 1 + seq_len) / block_size) + 1  # kept blocks
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    # block_list is the window-truncated set: K blocks * batch, flat.
+    block_list = torch.arange(K * batch_size, dtype=torch.long)
+    attn_metadata = SimpleNamespace(
+        is_prompt=True,
+        block_list=block_list,
+        context_lens_tensor=torch.tensor([context_len], dtype=torch.int32),
+        block_size=block_size)
+
+    proc = MagicMock(spec=HPUAttentionMetadataProcessor)
+    proc.use_sliding_window_kv = True
+    proc.prefill_use_fusedsdpa = True
+    proc.use_window_sdpa = False
+    proc.slice_thld = 1 << 30
+    proc.slice_size = 0
+    proc.block_size = block_size
+
+    captured = {}
+
+    def _fake_replace(obj, typename, **over):
+        captured.update(over)
+        return obj
+
+    monkeypatch.setattr(hm, "custom_tuple_replace", _fake_replace)
+
+    HPUAttentionMetadataProcessor._set_attn_bias_for_sliding_window(
+        proc, attn_metadata, batch_size, seq_len, window, device, dtype)
+
+    bias = captured["window_attn_bias"]
+    # Shape: [batch, 1, seq_len, K*block_size + seq_len]
+    assert bias.shape[0] == batch_size
+    assert bias.shape[2] == seq_len
+    # Context region (first K*block_size columns) must have finite entries for
+    # the last query row -> the layer attends to in-window cached context.
+    ctx_cols = K * block_size
+    last_row_ctx = bias[0, 0, -1, :ctx_cols]
+    assert torch.isfinite(last_row_ctx).any(), \
+        "window-relative mask must attend to some cached context (not all -inf)"
