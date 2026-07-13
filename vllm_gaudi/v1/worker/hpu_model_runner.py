@@ -6146,7 +6146,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # kernel block sizes; for other hybrid (mamba) models we still need to
         # reinitialize so that MultiGroupBlockTable has one entry per group.
         #kernel_block_sizes: list[int] = []
-        if self.num_gdn > 0 or self.num_mamba_like_layers > 0:
+        # Option A: interleaved sliding-window produces >1 attention group
+        # (full + sliding) with no mamba layers. The input batch's
+        # MultiGroupBlockTable must be reinitialized to one entry per group,
+        # otherwise block_table[sliding_gid] indexes out of range.
+        _multi_attn_groups = (self.use_sliding_window_kv
+                              and len(kv_cache_config.kv_cache_groups) > 1)
+        if self.num_gdn > 0 or self.num_mamba_like_layers > 0 or _multi_attn_groups:
             kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, self.attn_groups)
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
 
@@ -6482,7 +6488,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         else:
                             # Unexpected - still assert in this case
                             assert num_blocks >= kv_cache_config.num_blocks
-                    if isinstance(kv_cache_spec, FullAttentionSpec):
+                    if isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
                                                                               kv_cache_spec.num_kv_heads,
                                                                               kv_cache_spec.head_size)
