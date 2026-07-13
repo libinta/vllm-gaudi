@@ -76,6 +76,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     EncoderOnlyAttentionSpec,
 )
@@ -1568,12 +1569,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         and m.attn_type == AttentionType.DECODER
                         and getattr(m, 'kv_sharing_target_layer_name', None) is None
                     )
+                    layer_block_size = block_size
                     if attn_module.head_size < max_head_size:
                         layer_block_size = block_size * (max_head_size // attn_module.head_size)
-                    kv_cache_spec[layer_name] = FullAttentionSpec(block_size=block_size,
-                                                                  num_kv_heads=attn_module.num_kv_heads,
-                                                                  head_size=attn_module.head_size,
-                                                                  dtype=self.kv_cache_dtype)
+                    per_layer_sliding = getattr(attn_module, 'sliding_window', None)
+                    if self.use_sliding_window_kv and per_layer_sliding:
+                        kv_cache_spec[layer_name] = SlidingWindowSpec(block_size=layer_block_size,
+                                                                      num_kv_heads=attn_module.num_kv_heads,
+                                                                      head_size=attn_module.head_size,
+                                                                      dtype=self.kv_cache_dtype,
+                                                                      sliding_window=per_layer_sliding)
+                    else:
+                        kv_cache_spec[layer_name] = FullAttentionSpec(block_size=block_size,
+                                                                      num_kv_heads=attn_module.num_kv_heads,
+                                                                      head_size=attn_module.head_size,
+                                                                      dtype=self.kv_cache_dtype)
                 elif attn_module.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
                     # encoder-only attention does not need KV cache.
                     continue

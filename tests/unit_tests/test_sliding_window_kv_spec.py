@@ -65,3 +65,53 @@ def test_flag_on_but_not_interleaved_stays_off(monkeypatch):
     with patch("vllm_gaudi.v1.worker.hpu_model_runner.is_interleaved",
                return_value=False):
         assert _sliding_window_kv_enabled(cfg) is False
+
+
+# --------------------------------------------------------------------------
+# Task 2: per-layer spec emission
+# --------------------------------------------------------------------------
+from vllm.model_executor.layers.attention.attention import Attention  # noqa: E402
+from vllm.v1.attention.backend import AttentionType  # noqa: E402
+
+
+def _mk_attn_module(*, sliding_window, head_size, num_kv_heads):
+    m = MagicMock(spec=Attention)
+    m.attn_type = AttentionType.DECODER
+    m.sliding_window = sliding_window
+    m.head_size = head_size
+    m.num_kv_heads = num_kv_heads
+    m.kv_sharing_target_layer_name = None
+    return m
+
+
+def _spec_from_layers(layers, *, use_swa, block_size=128, dtype="bf16"):
+    """Drive the spec-emission branch in isolation via a stub runner."""
+    runner = MagicMock(spec=HPUModelRunner)
+    runner.use_sliding_window_kv = use_swa
+    runner.kv_cache_dtype = dtype
+    runner.shared_kv_cache_layers = {}
+    runner.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=layers),
+        cache_config=SimpleNamespace(block_size=block_size, cache_dtype="auto"))
+    return HPUModelRunner.get_kv_cache_spec(runner)
+
+
+def test_sliding_layer_emits_sliding_spec_when_enabled():
+    layers = {
+        "l0": _mk_attn_module(sliding_window=1024, head_size=256, num_kv_heads=8),
+        "l5": _mk_attn_module(sliding_window=None, head_size=512, num_kv_heads=2),
+    }
+    spec = _spec_from_layers(layers, use_swa=True)
+    assert isinstance(spec["l0"], SlidingWindowSpec)
+    assert spec["l0"].sliding_window == 1024
+    assert isinstance(spec["l5"], FullAttentionSpec)
+
+
+def test_all_full_when_disabled():
+    layers = {
+        "l0": _mk_attn_module(sliding_window=1024, head_size=256, num_kv_heads=8),
+        "l5": _mk_attn_module(sliding_window=None, head_size=512, num_kv_heads=2),
+    }
+    spec = _spec_from_layers(layers, use_swa=False)
+    assert isinstance(spec["l0"], FullAttentionSpec)
+    assert isinstance(spec["l5"], FullAttentionSpec)
