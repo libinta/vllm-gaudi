@@ -438,3 +438,25 @@ def test_old_cap_causes_wrong_bucket_warmup():
     # Uncapped version hits the target exactly
     assert total_uncapped == target_bucket_ctx, (f"Uncapped version should produce exactly {target_bucket_ctx} blocks, "
                                                  f"got {total_uncapped}")
+
+
+# --------------------------------------------------------------------------
+# Option A: sliding-window group decode-block cap
+# --------------------------------------------------------------------------
+def test_sliding_window_bucket_bounded_by_window():
+    """The sliding-group per-request block cap must equal the
+    SlidingWindowSpec.max_admission_blocks_per_request formula, i.e. it is
+    bounded by the window (+ scheduled tokens), not the full context."""
+    from vllm_gaudi.v1.worker.hpu_model_runner import (
+        _sliding_group_max_blocks_per_req)
+    block_size = 128
+    sliding_window = 1024
+    max_num_batched_tokens = 2048
+    expected_cap = math.ceil(
+        (sliding_window - 1 + max_num_batched_tokens) / block_size) + 1
+    assert _sliding_group_max_blocks_per_req(
+        sliding_window, block_size, max_num_batched_tokens) == expected_cap
+    # And it must be far smaller than a full 120k-context block count.
+    full_ctx_blocks = math.ceil(119918 / block_size)
+    assert _sliding_group_max_blocks_per_req(
+        sliding_window, block_size, max_num_batched_tokens) < full_ctx_blocks
