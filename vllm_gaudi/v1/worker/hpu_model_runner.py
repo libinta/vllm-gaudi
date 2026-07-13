@@ -2429,6 +2429,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 return gid
 
+    def _get_full_attention_group_id(self) -> int:
+        """Group index of the full-attention KV group.
+
+        With Option A the model has two attention groups (full + sliding);
+        the full group holds the dense, full-length KV that decode/prefill
+        default paths read.
+        """
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, FullAttentionSpec):
+                return gid
+        # Single-group / all-full fallback.
+        return self._get_attention_group_id_for_hybrid()
+
+    def _get_sliding_attention_group_id(self):
+        """Group index of the sliding-window KV group, or None when Option A
+        is off (single uniform group)."""
+        if not getattr(self, "use_sliding_window_kv", False):
+            return None
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, SlidingWindowSpec):
+                return gid
+        return None
+
     def _extract_prefill_batch_contents(self, num_prefills, num_decodes, num_scheduled_tokens, warmup=False):
         # DECODES are the first num_decodes REQUESTS.
         # PREFILLS are the next num_reqs - num_decodes REQUESTS.
@@ -3024,7 +3047,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if model_type is not None and model_type in ["gpt_oss"]:
                 sliding_block_size += 1
 
-            window_block_tables = [block_table[-sliding_block_size:] for block_table in block_tables_list]
+            swa_gid = self._get_sliding_attention_group_id()
+            if swa_gid is not None:
+                # Option A: sliding layers own a separate (window-bounded) KV
+                # pool with its own block ids. Read that group's block table
+                # instead of slicing the full-attention table, whose ids point
+                # into the full pool's KV tensor.
+                swa_block_table_cpu = self.input_batch.block_table[swa_gid].get_cpu_tensor()
+                swa_width = swa_block_table_cpu.shape[1]
+                window_block_tables = []
+                for i, n in enumerate(num_blocks):
+                    n_swa = min(int(n), swa_width)
+                    swa_row = swa_block_table_cpu[i, :n_swa].tolist()
+                    swa_row = self._resolve_all_blocks(swa_row)
+                    window_block_tables.extend([swa_row[-sliding_block_size:]] * num_tokens)
+            else:
+                window_block_tables = [block_table[-sliding_block_size:] for block_table in block_tables_list]
             window_block_list, window_block_groups, window_block_usage = \
                 self.get_habana_paged_attn_buffers(
                     window_block_tables, slot_mapping.tolist(),
@@ -6791,7 +6829,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Decodes are the first num_decodes requests.
         # Prefill are the next num_reqs - num_decodes requests.
         # Note: sampled_token_ids includes both decode and prefill sampled tokens
-        block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
+        block_table_cpu_tensor = self.input_batch.block_table[self._get_full_attention_group_id()].get_cpu_tensor()
         decode_block_table = block_table_cpu_tensor[:num_decodes]
 
         common_attn_metadata = decode_data.attn_metadata
@@ -6833,7 +6871,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # The input batch block table include both decodes and prefills
         # Decodes are the first num_decodes requests.
         # Prefill are the next num_reqs - num_decodes requests and divide into batches
-        block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
+        block_table_cpu_tensor = self.input_batch.block_table[self._get_full_attention_group_id()].get_cpu_tensor()
         batch_size = logits_indices.shape[0]
         prefill_batch_block_table = block_table_cpu_tensor[batch_start_idx:batch_start_idx + batch_size]
 

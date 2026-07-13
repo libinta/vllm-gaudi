@@ -115,3 +115,26 @@ def test_all_full_when_disabled():
     spec = _spec_from_layers(layers, use_swa=False)
     assert isinstance(spec["l0"], FullAttentionSpec)
     assert isinstance(spec["l5"], FullAttentionSpec)
+
+
+# --------------------------------------------------------------------------
+# Task 3: full/sliding attention group resolution
+# --------------------------------------------------------------------------
+def test_group_id_resolution():
+    runner = MagicMock(spec=HPUModelRunner)
+    runner.use_sliding_window_kv = True
+    runner.num_mamba_like_layers = 0
+    full = SimpleNamespace(kv_cache_spec=MagicMock(spec=FullAttentionSpec))
+    swa = SimpleNamespace(kv_cache_spec=MagicMock(spec=SlidingWindowSpec))
+    # Coordinator sorts full first, sliding second.
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[full, swa])
+    assert HPUModelRunner._get_full_attention_group_id(runner) == 0
+    assert HPUModelRunner._get_sliding_attention_group_id(runner) == 1
+
+
+def test_sliding_group_id_none_when_disabled():
+    runner = MagicMock(spec=HPUModelRunner)
+    runner.use_sliding_window_kv = False
+    full = SimpleNamespace(kv_cache_spec=MagicMock(spec=FullAttentionSpec))
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[full])
+    assert HPUModelRunner._get_sliding_attention_group_id(runner) is None
