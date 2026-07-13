@@ -669,6 +669,42 @@ def apply_model_specific_patches(model_runner):
     apply_hpu_llama4_post_load_patches(model_runner.model)
 
 
+def _sliding_window_kv_enabled(vllm_config) -> bool:
+    """Gate for Option A: emit SlidingWindowSpec for interleaved-SWA models.
+
+    Off by default. Requires VLLM_HPU_SLIDING_WINDOW_KV=1, an interleaved
+    sliding-window model, the hybrid KV cache manager enabled, and no
+    incompatible connector / eagle+chunked-local-attention config.
+    """
+    if os.getenv("VLLM_HPU_SLIDING_WINDOW_KV", "0").strip().lower() \
+            not in ("1", "true"):
+        return False
+    hf_text = vllm_config.model_config.hf_text_config
+    if not (is_interleaved(hf_text) and getattr(hf_text, "sliding_window", None)):
+        return False
+    # Core must not be unifying specs back to FullAttentionSpec.
+    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        return False
+    # eagle + chunked local attention is unsupported by the hybrid manager.
+    spec_cfg = vllm_config.speculative_config
+    if (getattr(vllm_config.model_config, "attention_chunk_size", None) is not None
+            and spec_cfg is not None
+            and getattr(spec_cfg, "use_eagle", lambda: False)()):
+        return False
+    return True
+
+
+def _sliding_group_max_blocks_per_req(sliding_window, block_size, max_num_batched_tokens):
+    """Per-request block cap for a sliding-window KV group.
+
+    Mirrors vllm SlidingWindowSpec.max_admission_blocks_per_request: hold the
+    last (sliding_window-1) computed tokens plus the newly scheduled tokens,
+    +1 for a partial-block window start.
+    """
+    num_tokens = sliding_window - 1 + max_num_batched_tokens
+    return math.ceil(num_tokens / block_size) + 1
+
+
 def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,
                                          mamba_block_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -1296,6 +1332,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.max_cudagraph_capture_size is None:
             self.max_cudagraph_capture_size = self.max_num_batched_tokens
         self.use_prefix_caching = (self.vllm_config.cache_config.enable_prefix_caching)
+        self.use_sliding_window_kv = _sliding_window_kv_enabled(self.vllm_config)
+        if self.use_sliding_window_kv:
+            logger.info(
+                "Sliding-window KV cache (Option A) ENABLED: sliding layers "
+                "will allocate KV only within the %s-token window.", self.sliding_window)
         self.bucketing_manager = HPUBucketingManager()
         max_num_prefill_seqs = self.max_num_seqs if self.use_merged_prefill \
                                else self.max_prefill_batch_size
