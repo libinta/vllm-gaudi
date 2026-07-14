@@ -554,7 +554,16 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
 
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
-        slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
+        # Option A: a sliding layer writes KV into its OWN KV cache group's
+        # blocks. Select the per-group slot_mapping (decode) so writes land in
+        # the same blocks the per-group read path fetches from.
+        slot_mapping_src = attn_metadata.slot_mapping
+        _wbg = getattr(attn_metadata, "window_by_gid", None)
+        _gid = getattr(self, "kv_cache_group_id", None)
+        if (self.sliding_window and not attn_metadata.is_prompt and _wbg
+                and _gid in _wbg and _wbg[_gid].get("slot_mapping") is not None):
+            slot_mapping_src = _wbg[_gid]["slot_mapping"]
+        slot_mapping = slot_mapping_src.flatten() if slot_mapping_src is not None else None
         key_cache = None
         value_cache = None
         k_scales = None

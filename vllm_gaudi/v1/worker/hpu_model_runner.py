@@ -3025,6 +3025,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
         slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
 
+        # Per-group slot_mapping (Option A): sliding layers write KV into their
+        # OWN group's blocks (distinct block-id namespace), so compute a
+        # slot_mapping from each sliding group's block table. Without this,
+        # writes land in the full group's slots while reads use the sliding
+        # group's -> KV divergence -> incorrect decode output.
+        window_slot_mapping_by_gid = {}
+        for gid in self._get_sliding_attention_group_ids():
+            g_bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            g_block_number = torch.ones((padded_batch_size, num_tokens), dtype=torch.int32) * self._PAD_BLOCK_ID
+            g_block_number[:num_decodes] = torch.gather(input=g_bt,
+                                                        dim=1,
+                                                        index=(index // decode_block_size))
+            g_block_number.apply_(self._resolve_block)
+            g_slot = g_block_number * decode_block_size + block_offsets
+            g_slot = g_slot[:padded_batch_size]
+            g_dummy = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
+            g_slot[num_decodes:].apply_(lambda _, ds=g_dummy: next(ds))
+            window_slot_mapping_by_gid[gid] = g_slot
+
         #####################################
         # NOTE(Chendi): Since we can't actually do num_tokens = 2,
         # convert to [batch_size * num_tokens, 1]
@@ -3191,6 +3210,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 "block_list": async_h2d_copy(window_block_lists_by_gid[gid], device=self.device),
                 "block_usage": async_h2d_copy(window_block_usage_by_gid[gid], device=self.device),
                 "block_groups": async_h2d_copy(window_block_groups_by_gid[gid], device=self.device),
+                "slot_mapping": async_h2d_copy(window_slot_mapping_by_gid[gid], device=self.device)
+                if gid in window_slot_mapping_by_gid else None,
             }
         chunked_block_list_device = async_h2d_copy(chunked_block_list,
                                                    device=self.device) if self.model_has_chunked_attention else None
