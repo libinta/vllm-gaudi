@@ -148,6 +148,11 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     window_block_groups: Optional[torch.Tensor] = None
     window_block_usage: Optional[torch.Tensor] = None
     window_attn_bias: Optional[torch.Tensor] = None
+    # Option A: per-sliding-group window buffers, keyed by KV cache group id.
+    # Each value is a dict with keys block_list/block_usage/block_groups and,
+    # after _set_block_mapping, block_mapping/attn_bias. A sliding layer selects
+    # its own group's entry via impl.kv_cache_group_id.
+    window_by_gid: Optional[dict] = None
     chunked_slot_mapping: Optional[torch.Tensor] = None
     chunked_attn_bias: Optional[torch.Tensor] = None
     chunked_block_mapping: Optional[torch.Tensor] = None
@@ -647,7 +652,18 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             # keep the zero-copy slice fetch (cache[:n]); only prefill needs gather.
             _set_fetch_by_id(self.k_cache, False)
             _set_fetch_by_id(self.v_cache, False)
-            if self.sliding_window and \
+            window_by_gid = getattr(attn_metadata, "window_by_gid", None)
+            _gid = getattr(self, "kv_cache_group_id", None)
+            if self.sliding_window and window_by_gid and _gid in window_by_gid:
+                # Option A: this sliding layer reads its OWN KV cache group's
+                # window block table (each sliding group has a distinct block-id
+                # namespace in the shared pool).
+                buf = window_by_gid[_gid]
+                block_list = buf["block_list"]
+                block_groups = buf["block_groups"]
+                block_mapping = buf["block_mapping"]
+                attn_bias = buf["attn_bias"]
+            elif self.sliding_window and \
                 attn_metadata.window_block_list is not None:
                 block_list = attn_metadata.window_block_list
                 block_groups = attn_metadata.window_block_groups

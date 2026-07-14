@@ -2443,14 +2443,42 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return self._get_attention_group_id_for_hybrid()
 
     def _get_sliding_attention_group_id(self):
-        """Group index of the sliding-window KV group, or None when Option A
-        is off (single uniform group)."""
+        """Group index of the (first) sliding-window KV group, or None when
+        Option A is off (single uniform group)."""
         if not getattr(self, "use_sliding_window_kv", False):
             return None
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, SlidingWindowSpec):
                 return gid
         return None
+
+    def _get_sliding_attention_group_ids(self):
+        """All sliding-window KV group indices (Option A may split the sliding
+        layers across several groups, e.g. gemma4's 5:1 pattern -> 5 sliding
+        groups). Empty when Option A is off."""
+        if not getattr(self, "use_sliding_window_kv", False):
+            return []
+        return [gid for gid, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, SlidingWindowSpec)]
+
+    def _stamp_attention_group_ids(self, kv_cache_config):
+        """Record each attention layer's KV cache group id on its impl.
+
+        Option A splits the model into several KV cache groups (e.g. gemma4:
+        1 full group + 5 sliding groups for a 5:1 pattern). Each group has its
+        own block table; a layer must read blocks from its OWN group. We stamp
+        ``kv_cache_group_id`` on every HPUAttentionImpl so hpu_attn.forward can
+        select the per-group block table at runtime.
+        """
+        if not getattr(self, "use_sliding_window_kv", False):
+            return
+        forward_ctx = self.vllm_config.compilation_config.static_forward_context
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                mod = forward_ctx.get(layer_name)
+                impl = getattr(mod, "impl", None)
+                if impl is not None:
+                    impl.kv_cache_group_id = gid
 
     def _extract_prefill_batch_contents(self, num_prefills, num_decodes, num_scheduled_tokens, warmup=False):
         # DECODES are the first num_decodes REQUESTS.
@@ -3039,6 +3067,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 block_size=decode_block_size,
             )
 
+        # Per-group window block tables (Option A): each sliding KV group has
+        # its own block table / block-id namespace, so build one set of paged
+        # buffers per sliding group, keyed by group id. hpu_attn selects the
+        # buffers for the layer's own group. When Option A is off there is a
+        # single shared window table built by slicing the full table's tail.
+        window_block_lists_by_gid = {}
+        window_block_groups_by_gid = {}
+        window_block_usage_by_gid = {}
         if self.interleaved_sliding_window:
             sliding_block_size = (self.sliding_window // decode_block_size)
 
@@ -3047,27 +3083,38 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if model_type is not None and model_type in ["gpt_oss"]:
                 sliding_block_size += 1
 
-            swa_gid = self._get_sliding_attention_group_id()
-            if swa_gid is not None:
-                # Option A: sliding layers own a separate (window-bounded) KV
-                # pool with its own block ids. Read that group's block table
-                # instead of slicing the full-attention table, whose ids point
-                # into the full pool's KV tensor.
-                swa_block_table_cpu = self.input_batch.block_table[swa_gid].get_cpu_tensor()
-                swa_width = swa_block_table_cpu.shape[1]
-                window_block_tables = []
-                for i, n in enumerate(num_blocks):
-                    n_swa = min(int(n), swa_width)
-                    swa_row = swa_block_table_cpu[i, :n_swa].tolist()
-                    swa_row = self._resolve_all_blocks(swa_row)
-                    window_block_tables.extend([swa_row[-sliding_block_size:]] * num_tokens)
+            sliding_gids = self._get_sliding_attention_group_ids()
+            if sliding_gids:
+                # Option A: sliding layers own separate (window-bounded) KV
+                # pools with their own block ids. Build per-group window tables.
+                for gid in sliding_gids:
+                    swa_block_table_cpu = self.input_batch.block_table[gid].get_cpu_tensor()
+                    swa_width = swa_block_table_cpu.shape[1]
+                    swa_rows = self._resolve_all_blocks(
+                        swa_block_table_cpu[:len(num_blocks)].tolist())
+                    wbt = []
+                    for i, n in enumerate(num_blocks):
+                        n_swa = min(int(n), swa_width)
+                        wbt.extend([swa_rows[i][:n_swa][-sliding_block_size:]] * num_tokens)
+                    wl, wg, wu = self.get_habana_paged_attn_buffers(
+                        wbt, slot_mapping.tolist(),
+                        padded_batch_size * num_tokens, block_size=decode_block_size)
+                    window_block_lists_by_gid[gid] = wl
+                    window_block_groups_by_gid[gid] = wg
+                    window_block_usage_by_gid[gid] = wu
+                # Also expose the first sliding group's buffers on the legacy
+                # scalar fields for any path that has not been group-routed.
+                _first = sliding_gids[0]
+                window_block_list = window_block_lists_by_gid[_first]
+                window_block_groups = window_block_groups_by_gid[_first]
+                window_block_usage = window_block_usage_by_gid[_first]
             else:
                 window_block_tables = [block_table[-sliding_block_size:] for block_table in block_tables_list]
-            window_block_list, window_block_groups, window_block_usage = \
-                self.get_habana_paged_attn_buffers(
-                    window_block_tables, slot_mapping.tolist(),
-                    padded_batch_size * num_tokens,
-                    block_size=decode_block_size)
+                window_block_list, window_block_groups, window_block_usage = \
+                    self.get_habana_paged_attn_buffers(
+                        window_block_tables, slot_mapping.tolist(),
+                        padded_batch_size * num_tokens,
+                        block_size=decode_block_size)
 
         if self.model_has_chunked_attention:
             chunk_size_in_blocks = (self.model.model.config.text_config.attention_chunk_size // decode_block_size)
@@ -3136,6 +3183,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                    device=self.device) if self.interleaved_sliding_window else None
         window_block_groups_device = async_h2d_copy(window_block_groups,
                                                     device=self.device) if self.interleaved_sliding_window else None
+        # Per-group window buffers (Option A): device copies keyed by group id.
+        # block_mapping/attn_bias are filled later in _set_block_mapping.
+        window_by_gid_device = {}
+        for gid in window_block_lists_by_gid:
+            window_by_gid_device[gid] = {
+                "block_list": async_h2d_copy(window_block_lists_by_gid[gid], device=self.device),
+                "block_usage": async_h2d_copy(window_block_usage_by_gid[gid], device=self.device),
+                "block_groups": async_h2d_copy(window_block_groups_by_gid[gid], device=self.device),
+            }
         chunked_block_list_device = async_h2d_copy(chunked_block_list,
                                                    device=self.device) if self.model_has_chunked_attention else None
         chunked_block_usage_device = async_h2d_copy(chunked_block_usage,
@@ -3187,6 +3243,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             window_block_list=window_block_list_device,
             window_block_usage=window_block_usage_device,
             window_block_groups=window_block_groups_device,
+            window_by_gid=window_by_gid_device if window_by_gid_device else None,
             chunked_block_list=chunked_block_list_device,
             chunked_block_usage=chunked_block_usage_device,
             chunked_block_groups=chunked_block_groups_device,
@@ -5307,10 +5364,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         num_blocks = round_up(total_tokens_for_blocks, self.block_size) // self.block_size
 
         req_id = f'{len(requests)}'
-        block_ids = [[block_id] *
-                     (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_like_layers > 0 else [[block_id] *
-                                                                                                            num_blocks]
+        # Build per-group block_ids whenever there is more than one KV cache
+        # group (mamba hybrids, or Option A's full+sliding attention split),
+        # sizing each group's list to that group's own block_size. A single
+        # flat list is only correct for the single-group case.
+        if self.num_mamba_like_layers > 0 or len(self.kv_cache_config.kv_cache_groups) > 1:
+            block_ids = [[block_id] *
+                         (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
+                         for g in self.kv_cache_config.kv_cache_groups]
+        else:
+            block_ids = [[block_id] * num_blocks]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
             if hasattr(self.model_config, 'task') and self.model_config.task is not None:
@@ -6420,7 +6483,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         pass
         else:  # non-hybrid scenario
+            # Track already-allocated shared buffers keyed by the id() of the
+            # KVCacheTensor, so layers that share one KVCacheTensor (core's
+            # hybrid layout packs several layers per tensor via distinct block
+            # tables) reuse the SAME device allocation instead of each grabbing
+            # a full-size tensor (which would over-allocate by group_size x and
+            # OOM). All layers sharing a tensor have identical per-block numel
+            # and dtype (that is why core groups them), so the buffer is
+            # directly reusable across them.
+            shared_tensor_cache: dict[int, tuple] = {}
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                _tensor_key = id(kv_cache_tensor)
                 for layer_name in kv_cache_tensor.shared_by:
                     # Get the correct spec for this layer
                     kv_cache_spec = None
@@ -6502,13 +6575,27 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         min_val = torch.finfo(torch.bfloat16).tiny
                         kv_scales_shape = list(kv_cache_shape)
                         kv_scales_shape[-1] = 1
-                        key_cache = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
-                        # initialize scale tensor with minimal scale values
+                        # When several layers share one KVCacheTensor (core's
+                        # hybrid layout, e.g. Option A full+sliding), allocate the
+                        # backing K/V buffers ONCE and give each layer its own
+                        # view shaped to that layer's (num_kv_heads, head_size).
+                        # All layers in a pool have equal per-block numel, so the
+                        # flat storage reshapes cleanly; they index disjoint blocks
+                        # via per-group block tables.
+                        shared = shared_tensor_cache.get(_tensor_key)
+                        if shared is None:
+                            key_backing = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
+                            value_backing = torch.zeros(v_cache_shape, dtype=dtype,
+                                                        device=self.device) if v_cache_shape is not None else None
+                            shared_tensor_cache[_tensor_key] = (key_backing, value_backing)
+                        else:
+                            key_backing, value_backing = shared
+                        key_cache = key_backing.view(kv_cache_shape)
                         key_scales = \
                             torch.ones(kv_scales_shape, dtype=torch.bfloat16, device=self.device) * min_val \
                             if create_dynamic_scales else None
                         if v_cache_shape is not None:
-                            value_cache = torch.zeros(v_cache_shape, dtype=dtype, device=self.device)
+                            value_cache = value_backing.view(v_cache_shape)
                             value_scales_on_T = \
                                 torch.ones(kv_scales_shape, dtype=torch.bfloat16, device=self.device) * min_val \
                                 if create_dynamic_scales else None
@@ -6545,6 +6632,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 kv_caches[layer_name] = kv_caches[target_layer_name]
         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
+        # Option A: record each attention layer's KV cache group id so the
+        # attention forward can select its own group's (per-group) block table.
+        self._stamp_attention_group_ids(kv_cache_config)
 
         if self.enable_bucketing:
             self.bucketing_manager.num_hpu_blocks = num_blocks
@@ -7405,7 +7495,35 @@ class HPUAttentionMetadataProcessor:
                                                         update_for_chunked_attention=True)
             if self.interleaved_sliding_window:
                 attn_metadata = self._set_block_mapping(attn_metadata, batch_size, device, dtype, True)
+                attn_metadata = self._set_window_block_mapping_per_group(attn_metadata, batch_size, device, dtype)
         return attn_metadata
+
+    def _set_window_block_mapping_per_group(self, metadata, batch_size, device, dtype):
+        """Compute block_mapping + attn_bias for each per-sliding-group window
+        buffer (Option A). Mutates metadata.window_by_gid entries in place."""
+        window_by_gid = getattr(metadata, "window_by_gid", None)
+        if not window_by_gid:
+            return metadata
+        block_size = getattr(metadata, "block_size", self.block_size)
+        for gid, buf in window_by_gid.items():
+            block_usage = buf["block_usage"]
+            block_groups = buf["block_groups"]
+            mask = torch.arange(0, block_size, device=device, dtype=torch.int32).unsqueeze(0)
+            mask = mask >= block_usage.unsqueeze(-1)
+            attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
+            if not is_fake_hpu():
+                block_mapping = torch.nn.functional.one_hot(block_groups, num_classes=batch_size)
+            else:
+                block_groups = block_groups.to(torch.long)
+                block_mapping = torch.nn.functional.relu(block_groups)
+                block_mapping = torch.nn.functional.one_hot(block_mapping, num_classes=batch_size)
+                oob_values = block_groups.lt(0)
+                block_mapping.masked_fill_(oob_values.unsqueeze(-1), 0)
+                block_groups.masked_fill_(oob_values, batch_size)
+                buf["block_groups"] = block_groups
+            buf["block_mapping"] = block_mapping.to(dtype)
+            buf["attn_bias"] = attn_bias
+        return metadata
 
 
 def _apply_inc_patch():

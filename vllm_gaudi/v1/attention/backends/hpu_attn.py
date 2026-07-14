@@ -132,7 +132,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              load_indices_tensor=None,
                              store_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             window_by_gid=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -145,6 +146,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    window_block_list=window_block_list,
                    window_block_usage=window_block_usage,
                    window_block_groups=window_block_groups,
+                   window_by_gid=window_by_gid,
                    chunked_block_list=chunked_block_list,
                    chunked_block_usage=chunked_block_usage,
                    chunked_block_groups=chunked_block_groups,
