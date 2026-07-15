@@ -620,8 +620,32 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                                                      k_scales, v_scales)
 
             if self.sliding_window:
+                window_slice_on = get_config().enable_fsdpa_window_slicing
                 if hasattr(attn_metadata, 'window_attn_bias') and attn_metadata.window_attn_bias is not None:
                     attn_bias = attn_metadata.window_attn_bias
+                    # When the sliced FusedSDPA path handles this
+                    # prefix-prefill, also pass window_size so it can skip KV
+                    # chunks that fall entirely outside the window. The window
+                    # band stays encoded in window_attn_bias; window_size only
+                    # gates the chunk-skip optimization. Off by default.
+                    if window_slice_on:
+                        common_args['window_size'] = (self.sliding_window, 0)
+                elif window_slice_on and attn_metadata.block_list is not None:
+                    # Memory win: the model runner skipped building the
+                    # full window mask for this prefix-prefill. Pass window_size +
+                    # the valid context length so the sliced path builds small
+                    # per-chunk band masks on the fly (no full mask allocation).
+                    attn_bias = None
+                    common_args['window_size'] = (self.sliding_window, 0)
+                    # Prefer the host-side max precomputed during metadata prep
+                    # (no device sync). Fall back to the device reduction only
+                    # if it wasn't populated (e.g. older/dummy metadata).
+                    max_ctx = getattr(attn_metadata, 'max_context_len', None)
+                    if max_ctx is not None:
+                        common_args['context_len'] = int(max_ctx)
+                    else:
+                        ctx_lens = attn_metadata.context_lens_tensor
+                        common_args['context_len'] = int(ctx_lens.max().item()) if ctx_lens is not None else 0
                 else:
                     attn_bias = None
                     window_size = (self.sliding_window, 0)

@@ -33,7 +33,7 @@ from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemoryProfiler, HabanaProfilerCounterHelper,
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import finalize_config, get_config
-from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
+from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default, window_slicing_will_skip_chunks
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 
@@ -938,7 +938,8 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
     # input_hash(123) != input_hash(321)
     # input_hash("abc") != input_hash("cba")
     attention_metadata = subtuple(metadata, 'TrimmedAttentionMetadata', [
-        'attn_bias', 'seq_lens_tensor', 'context_lens_tensor', 'block_list', 'block_mapping', 'block_usage',
+        'attn_bias', 'seq_lens_tensor', 'context_lens_tensor', 'max_context_len', 'block_list', 'block_mapping',
+        'block_usage',
         'slot_mapping', 'is_prompt', 'block_size', 'block_groups', 'window_block_list', 'window_block_mapping',
         'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
@@ -2735,6 +2736,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             seqlens_offsets_for_blocks = None
             mamba_chunks_to_block_mapping = None
 
+        # Host-side max of the valid context lengths, taken from the int list
+        # BEFORE it is copied to device. The window-sliced prefill path needs
+        # this scalar to build per-chunk band masks; reading it here avoids a
+        # per-layer ctx_lens.max().item() device->host sync in hpu_attn.
+        max_context_len = int(max(context_lens)) if len(context_lens) > 0 else 0
         query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
         token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
         token_positions = async_h2d_copy(token_positions, dtype=torch.int32)
@@ -2747,6 +2753,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(
             seq_lens_tensor=query_lens,
             context_lens_tensor=context_lens,
+            max_context_len=max_context_len,
             slot_mapping=token_slots,
             block_list=context_blocks_t,
             attn_bias=attn_bias,
@@ -7069,6 +7076,33 @@ class HPUAttentionMetadataProcessor:
             seq_len % self.slice_size == 0 and attn_metadata.block_list is None:
             # no need to set sliding window mask, just use built-in window-sdpa
             return attn_metadata
+
+        # Sliding-window memory win: when the sliced FusedSDPA path will handle
+        # this prefix-prefill, do NOT materialize the full [batch,1,seq,ctx+seq]
+        # window mask. The kernel builds small per-chunk band masks on the fly.
+        # Must mirror the kernel's will_skip condition exactly (utils.py
+        # ModuleFusedSDPA.forward): window-aware slicing only engages when
+        # prefix_len >= chunk_size + window_left, i.e. at least one KV chunk
+        # falls entirely outside the window and can be skipped. Below that
+        # threshold the kernel falls through to normal attention and needs the
+        # full mask -- so we must build it here.
+        if self.prefill_use_fusedsdpa and attn_metadata.block_list is not None and batch_size == 1 \
+            and get_config().enable_fsdpa_slicing \
+            and get_config().enable_fsdpa_window_slicing:
+            block_list = attn_metadata.block_list
+            block_size = getattr(prefill_metadata, "block_size", self.block_size)
+            prefix_len = (block_list.size(-1) // batch_size) * block_size
+            fsdpa_chunk_size = int(
+                os.environ.get("VLLM_HPU_FSDPA_SLICE_CHUNK_SIZE",
+                               str(max(1024, (min(seq_len, 8192) // 2 // 1024) * 1024))))
+            if window_slicing_will_skip_chunks(prefix_len, fsdpa_chunk_size, window_size):
+                # Leave window_attn_bias unset; hpu_attn passes window_size +
+                # context_len so the kernel skips out-of-window chunks and
+                # builds band masks without the full mask allocation.
+                logger.debug_once("Sliding-window memory win: skipping full window mask build "
+                                  f"(prefix_len={prefix_len}, chunk_size={fsdpa_chunk_size}, "
+                                  f"window={window_size}, seq_len={seq_len}).")
+                return attn_metadata
 
         if self.prefill_use_fusedsdpa and attn_metadata.block_list is not None:
             context_lens_t = prefill_metadata.context_lens_tensor

@@ -403,6 +403,7 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
                             valid_seq_lengths: Optional[torch.Tensor] = None,
                             window_size: Optional[int] = None,
                             sinks: Optional[torch.Tensor] = None,
+                            context_len: Optional[int] = None,
                             **ignored_args) -> torch.Tensor:
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
@@ -433,7 +434,10 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
     # use sinks in fsdpa
     if sinks is not None:
         args += [sinks]
-    attn_weights = fsdpa_op(*args)
+    # context_len only reaches the sliding-window memory-win path;
+    # pass it as a keyword only when set so all other calls are unchanged.
+    extra_kwargs = {'context_len': context_len} if context_len is not None else {}
+    attn_weights = fsdpa_op(*args, **extra_kwargs)
 
     attn_weights = attn_weights.transpose(1, 2)
     if sinks is not None:

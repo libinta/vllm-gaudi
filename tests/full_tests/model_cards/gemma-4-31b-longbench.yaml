@@ -1,0 +1,14 @@
+model_card:
+  model_name: google/gemma-4-31B-it
+  tasks: longbench_triviaqa
+  num_fewshot: 0
+  trust_remote_code: true
+  limit: 20
+  max_model_len: 32768
+  max_num_seqs: 8
+  apply_chat_template: true
+  fewshot_as_multiturn: true
+
+metrics:
+  name: qa_f1_score,none
+  value: 0.0  # baseline-to-measure; comparison is baseline vs window-aware slicing, not vs threshold

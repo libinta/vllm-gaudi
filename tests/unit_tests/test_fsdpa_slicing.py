@@ -52,10 +52,13 @@ requires_hpu = pytest.mark.skipif(not _hpu_available(), reason="HPU device not a
 class _MockBucketingManager:
     """Lightweight mock for HPUBucketingManager."""
 
-    def __init__(self, initialized=True, max_num_batched_tokens=8192, block_size=128, strategy_cls=None):
+    def __init__(self, initialized=True, max_num_batched_tokens=8192, block_size=128, strategy_cls=None,
+                max_num_prefill_seqs=64, max_model_len=8192):
         self.initialized = initialized
         self.max_num_batched_tokens = max_num_batched_tokens
         self.block_size = block_size
+        self.max_num_prefill_seqs = max_num_prefill_seqs
+        self.max_model_len = max_model_len
         self._strategy_cls = strategy_cls
 
     def get_bucketing_strategy(self):
@@ -71,6 +74,7 @@ def _make_config(**overrides):
         bucketing_strategy='pad',
         merged_prefill=False,
         use_bucketing=True,
+        enable_fsdpa_window_slicing=False,
     )
     defaults.update(overrides)
     return Config(defaults)
@@ -89,9 +93,12 @@ class TestEnableFsdpaSlicingFeature:
         def fsdpa_loader():
             return True  # simulate kernel available
 
+        # Mirrors the real declaration in features.py: use_bucketing +
+        # not-merged_prefill + kernel available. No longer requires
+        # bucketing_strategy == 'pad' (see extension/utils.py._max_bucket_gap).
         return Value(
             'enable_fsdpa_slicing',
-            All(Eq('bucketing_strategy', 'pad'), Disabled('merged_prefill'), Kernel(fsdpa_loader)),
+            All(Eq('use_bucketing', True), Disabled('merged_prefill'), Kernel(fsdpa_loader)),
             env_var='VLLM_HPU_FSDPA_SLICE_ENABLED',
             env_var_type=boolean,
         )
@@ -100,6 +107,7 @@ class TestEnableFsdpaSlicingFeature:
         """Create a Config with the VLLM_HPU_FSDPA_SLICE_ENABLED env flag registered."""
         defaults = dict(bucketing_strategy='pad',
                         merged_prefill=False,
+                        use_bucketing=True,
                         hw='gaudi3',
                         VLLM_HPU_FSDPA_SLICE_ENABLED=Env('VLLM_HPU_FSDPA_SLICE_ENABLED', boolean))
         defaults.update(overrides)
@@ -110,15 +118,18 @@ class TestEnableFsdpaSlicingFeature:
         cfg = self._make_cfg()
         assert feature(cfg) is True
 
-    def test_disabled_when_not_pad_strategy(self):
+    def test_enabled_when_exp_strategy(self):
+        # exp/lin no longer gate the feature: SlicedFusedSDPABase derives the
+        # padded-chunk bound from the strategy's own bucket gaps when it
+        # isn't padding-aware (see _max_bucket_gap in extension/utils.py).
         feature = self._make_feature()
         cfg = self._make_cfg(bucketing_strategy='exp')
-        assert feature(cfg) is False
+        assert feature(cfg) is True
 
-    def test_disabled_when_lin_strategy(self):
+    def test_enabled_when_lin_strategy(self):
         feature = self._make_feature()
         cfg = self._make_cfg(bucketing_strategy='lin')
-        assert feature(cfg) is False
+        assert feature(cfg) is True
 
     def test_disabled_when_merged_prefill(self):
         feature = self._make_feature()
@@ -189,15 +200,25 @@ class TestSetupSlicing:
         result = base._setup_slicing()
         assert result is False
 
+    @patch('habana_frameworks.torch.utils.internal.is_lazy', return_value=False)
     @patch('vllm_gaudi.extension.utils.get_config')
     @patch('vllm_gaudi.extension.bucketing.common.HPUBucketingManager.get_instance')
-    def test_disabled_when_not_pad_strategy(self, mock_get_instance, mock_get_config):
-        mock_get_config.return_value = _make_config(bucketing_strategy='exp')
-        mock_get_instance.return_value = None
+    def test_enabled_with_exp_strategy_derives_padded_chunks_from_bucket_gaps(self, mock_get_instance, mock_get_config,
+                                                                              mock_is_lazy):
+        # exp strategy has no explicit PAD_MAX; _setup_slicing must derive
+        # num_padded_query_chunks/num_padded_ctx_chunks from the strategy's
+        # own generated bucket list instead of raising or disabling.
+        from vllm_gaudi.extension.bucketing.exponential import ExponentialBucketingStrategy
+        mock_get_config.return_value = _make_config(bucketing_strategy='exp', enable_fsdpa_window_slicing=False)
+        mock_get_instance.return_value = _MockBucketingManager(max_num_batched_tokens=8192, block_size=128,
+                                                               strategy_cls=ExponentialBucketingStrategy,
+                                                               max_num_prefill_seqs=64, max_model_len=8192)
 
         base = SlicedFusedSDPABase.__new__(SlicedFusedSDPABase)
         result = base._setup_slicing()
-        assert result is False
+        assert result is True
+        assert base.num_padded_query_chunks >= 0
+        assert base.num_padded_ctx_chunks >= 0
 
     @patch('vllm_gaudi.extension.utils.get_config')
     @patch('vllm_gaudi.extension.bucketing.common.HPUBucketingManager.get_instance')
@@ -229,15 +250,22 @@ class TestSetupSlicing:
         with pytest.raises(AssertionError):
             base._setup_slicing()
 
+    @patch('habana_frameworks.torch.utils.internal.is_lazy', return_value=False)
     @patch('vllm_gaudi.extension.utils.get_config')
     @patch('vllm_gaudi.extension.bucketing.common.HPUBucketingManager.get_instance')
-    def test_raises_when_not_padding_aware_strategy(self, mock_get_instance, mock_get_config):
-        mock_get_config.return_value = _make_config()
-        mock_get_instance.return_value = _MockBucketingManager(strategy_cls=LinearBucketingStrategy)
+    def test_enabled_when_manager_strategy_is_not_padding_aware(self, mock_get_instance, mock_get_config,
+                                                                 mock_is_lazy):
+        # The actual strategy OBJECT (not the config's bucketing_strategy
+        # string) decides pad vs. derived-from-bucket-gaps; a non-pad strategy
+        # instance takes the derived path and still enables successfully.
+        mock_get_config.return_value = _make_config(enable_fsdpa_window_slicing=False)
+        mock_get_instance.return_value = _MockBucketingManager(strategy_cls=LinearBucketingStrategy,
+                                                               max_num_batched_tokens=8192, block_size=128,
+                                                               max_num_prefill_seqs=64, max_model_len=8192)
 
         base = SlicedFusedSDPABase.__new__(SlicedFusedSDPABase)
-        with pytest.raises(AssertionError):
-            base._setup_slicing()
+        result = base._setup_slicing()
+        assert result is True
 
     @patch('habana_frameworks.torch.utils.internal.is_lazy', return_value=False)
     @patch('vllm_gaudi.extension.utils.get_config')
@@ -277,6 +305,59 @@ class TestSetupSlicing:
         result = base._setup_slicing()
         assert result is True
         assert base.slice_thld == 8192
+
+    @patch('habana_frameworks.torch.utils.internal.is_lazy', return_value=False)
+    @patch('vllm_gaudi.extension.utils.get_config')
+    @patch('vllm_gaudi.extension.bucketing.common.HPUBucketingManager.get_instance')
+    def test_window_slicing_raises_threshold_to_max_model_len(self, mock_get_instance, mock_get_config, mock_is_lazy):
+        # Non-window (full-attention) layers never take the window branch in
+        # ModuleFusedSDPA.forward, so they fall into the plain base-sliced
+        # branch whenever kv_len >= slice_thld. That base-sliced branch is
+        # broken for models with heterogeneous per-layer-type attention (e.g.
+        # gemma-4): confirmed via real-prompt replay that every request
+        # crossing slice_thld comes back garbled. Enabling window slicing must
+        # raise slice_thld to max_model_len so no served request's
+        # full-attention layers can ever hit that branch.
+        mock_get_config.return_value = _make_config(enable_fsdpa_window_slicing=True)
+        mock_get_instance.return_value = _MockBucketingManager(max_num_batched_tokens=8192, block_size=128,
+                                                               max_model_len=131072)
+
+        base = SlicedFusedSDPABase.__new__(SlicedFusedSDPABase)
+        result = base._setup_slicing()
+        assert result is True
+        assert base.slice_thld == 131072
+
+    @patch('habana_frameworks.torch.utils.internal.is_lazy', return_value=False)
+    @patch('vllm_gaudi.extension.utils.get_config')
+    @patch('vllm_gaudi.extension.bucketing.common.HPUBucketingManager.get_instance')
+    def test_window_slicing_threshold_unaffected_when_already_above_max_model_len(self, mock_get_instance,
+                                                                                  mock_get_config, mock_is_lazy):
+        mock_get_config.return_value = _make_config(enable_fsdpa_window_slicing=True)
+        mock_get_instance.return_value = _MockBucketingManager(max_num_batched_tokens=8192, block_size=128,
+                                                               max_model_len=4096)
+
+        base = SlicedFusedSDPABase.__new__(SlicedFusedSDPABase)
+        result = base._setup_slicing()
+        assert result is True
+        assert base.slice_thld == 8192
+
+    @patch('habana_frameworks.torch.utils.internal.is_lazy', return_value=False)
+    @patch('vllm_gaudi.extension.utils.get_config')
+    @patch('vllm_gaudi.extension.bucketing.common.HPUBucketingManager.get_instance')
+    def test_window_slicing_threshold_raise_does_not_change_chunk_size(self, mock_get_instance, mock_get_config,
+                                                                        mock_is_lazy):
+        # chunk_size must be derived from the pre-raise threshold, not the
+        # raised one -- otherwise chunk_size would balloon towards
+        # max_model_len // 2 and defeat the point of chunking.
+        mock_get_config.return_value = _make_config(enable_fsdpa_window_slicing=True)
+        mock_get_instance.return_value = _MockBucketingManager(max_num_batched_tokens=8192, block_size=128,
+                                                               max_model_len=131072)
+
+        base = SlicedFusedSDPABase.__new__(SlicedFusedSDPABase)
+        result = base._setup_slicing()
+        assert result is True
+        assert base.slice_thld == 131072
+        assert base.chunk_size == 4096
 
     @patch('habana_frameworks.torch.utils.internal.is_lazy', return_value=False)
     @patch('vllm_gaudi.extension.utils.get_config')
@@ -444,6 +525,44 @@ class TestSetupSlicing:
         base = SlicedFusedSDPABase.__new__(SlicedFusedSDPABase)
         with pytest.raises(AssertionError):
             base._setup_slicing()
+
+
+# ---------------------------------------------------------------------------
+# _max_bucket_gap: derives the padded-chunk bound for non-pad strategies
+# ---------------------------------------------------------------------------
+
+
+class TestMaxBucketGap:
+    """SlicedFusedSDPABase._max_bucket_gap(bucket_values) -> largest gap
+    between consecutive sorted bucket values, i.e. the worst-case padding
+    (same units as bucket_values) any request routed through this bucket set
+    can receive."""
+
+    gap = staticmethod(SlicedFusedSDPABase._max_bucket_gap)
+
+    def test_empty_list_has_no_gap(self):
+        assert self.gap([]) == 0
+
+    def test_single_bucket_has_no_gap(self):
+        assert self.gap([128]) == 0
+
+    def test_evenly_spaced_buckets_have_zero_gap(self):
+        # consecutive integers -> no padding possible
+        assert self.gap([0, 1, 2, 3, 4]) == 0
+
+    def test_uneven_spacing_reports_largest_gap(self):
+        # matches the real base exponential ctx bucket list (in blocks):
+        # gaps are 0,0,1,3,7,15,31,62,124,250,519 -> max is 519
+        vals = [0, 1, 2, 4, 8, 16, 32, 64, 127, 252, 503, 1023]
+        assert self.gap(vals) == 519
+
+    def test_unsorted_input_still_finds_max_gap(self):
+        assert self.gap([100, 0, 50]) == self.gap([0, 50, 100])
+
+    def test_duplicate_values_are_deduplicated(self):
+        # a duplicate shouldn't be treated as a zero-width bucket that
+        # artificially shrinks the reported max gap
+        assert self.gap([0, 10, 10, 10, 30]) == self.gap([0, 10, 30])
 
 
 # ---------------------------------------------------------------------------

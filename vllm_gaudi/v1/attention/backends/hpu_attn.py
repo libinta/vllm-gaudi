@@ -58,6 +58,11 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     attn_bias: Optional[torch.Tensor]
     seq_lens_tensor: Optional[torch.Tensor]
     context_lens_tensor: Optional[torch.Tensor]
+    # Host-side max over context_lens_tensor, precomputed once during metadata
+    # prep from the host int list (no device sync). Lets the window-sliced
+    # prefill path get the valid context length without a per-layer
+    # ``ctx_lens.max().item()`` device->host sync (50 syncs/fwd on gemma-4).
+    max_context_len: Optional[int] = None
     query_start_loc: Optional[torch.Tensor] = None
     query_start_loc_p: Optional[torch.Tensor] = None
     padding_mask_flat: Optional[torch.Tensor] = None
@@ -81,6 +86,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               seq_lens_tensor,
                               slot_mapping,
                               block_size,
+                              max_context_len=None,
                               prep_initial_states=None,
                               has_initial_states_p=None,
                               last_chunk_indices_p=None,
@@ -99,6 +105,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    attn_bias=attn_bias,
                    alibi_blocks=None,
                    context_lens_tensor=context_lens_tensor,
+                   max_context_len=max_context_len,
                    seq_lens_tensor=seq_lens_tensor,
                    input_positions=None,
                    slot_mapping=slot_mapping,

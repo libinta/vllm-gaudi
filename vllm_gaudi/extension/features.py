@@ -61,6 +61,7 @@ def get_user_flags():
         Env('VLLM_HPU_FSDPA_SLICE_SEQ_LEN_THLD', int),
         Env('VLLM_HPU_FSDPA_SLICE_CHUNK_SIZE', int),
         Env('VLLM_HPU_FSDPA_SLICE_WITH_GRAPH_BREAKS', boolean),
+        Env('VLLM_HPU_FSDPA_SLICE_WINDOW', boolean),
     ]
     return to_dict(flags)
 
@@ -120,10 +121,23 @@ def get_features():
               All(VersionRange(">=1.24.0.460"), MinPackageVersion("neural_compressor_pt", "3.7")),
               env_var_type=boolean),
         Value('use_hpu_aligned_scale', False, env_var='HPU_ALIGNED_SCALE', env_var_type=boolean),
+        # Padding-aware ('pad') bucketing exposes an explicit padding bound
+        # (PAD_MAX) that SlicedFusedSDPABase used to require outright; other
+        # bucketing strategies ('exp', 'lin') now derive the same bound from
+        # their own generated bucket list's worst-case gap (see
+        # SlicedFusedSDPABase._setup_slicing / _max_bucket_gap in
+        # extension/utils.py), so the strategy restriction was dropped here.
         Value('enable_fsdpa_slicing',
-              All(Eq('use_bucketing', True), Eq('bucketing_strategy', 'pad'), Disabled('merged_prefill'),
-                  Kernel(fsdpa)),
+              All(Eq('use_bucketing', True), Disabled('merged_prefill'), Kernel(fsdpa)),
               env_var='VLLM_HPU_FSDPA_SLICE_ENABLED',
+              env_var_type=boolean),
+        # Window-aware FusedSDPA slicing: skip KV chunks that fall entirely
+        # outside the sliding window and build small per-chunk band masks on
+        # the fly instead of materialising the full window mask. Requires
+        # enable_fsdpa_slicing. Off by default (opt-in).
+        Value('enable_fsdpa_window_slicing',
+              False,
+              env_var='VLLM_HPU_FSDPA_SLICE_WINDOW',
               env_var_type=boolean),
     ]
     return split_values_and_flags(features)
