@@ -6207,11 +6207,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
         start_time = time.perf_counter()
 
-        # In lazy mode, run MM warmup outside PT_COMPILE_ONLY_MODE
-        # to avoid GC errors. In torch.compile mode, run it inside
-        # for faster recipe-only compilation.
-        use_torch_compile = (not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager)
-        if self.supports_mm_inputs and not use_torch_compile:
+        # Multimodal (vision) warmup MUST run outside PT_COMPILE_ONLY_MODE.
+        # The gemma-4 vision pooler strips padding with a data-dependent gather
+        # (output row count depends on runtime values). PT_COMPILE_ONLY_MODE
+        # traces recipes without executing them, so the gather output size is
+        # never materialized -> uninitialised tensor metadata -> garbage offset
+        # -> RuntimeError during warmup. Execute it for real to warm the recipe;
+        # only the LLM prefill/decode warmup below runs under compile-only.
+        if self.supports_mm_inputs:
             self.warmup_multimodal_graphs(self.get_model().vision_bucket_manager.multimodal_buckets)
 
         compile_only_mode_context = functools.partial(bc.env_setting, "PT_COMPILE_ONLY_MODE", True)
@@ -6226,9 +6229,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                            'Warmup time will be negatively impacted. '
                            'Please update Gaudi Software Suite.')
         with compile_only_mode_context() if can_use_compile_only_mode else contextlib.nullcontext():
-            if self.supports_mm_inputs and use_torch_compile:
-                self.warmup_multimodal_graphs(self.get_model().vision_bucket_manager.multimodal_buckets)
-
             if not self.model_config.enforce_eager and not self.is_pooling_model:
                 assert self.mem_margin is not None, \
                     ("HabanaWorker.determine_num_available_blocks needs "
